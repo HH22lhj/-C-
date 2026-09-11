@@ -1,5 +1,10 @@
 """
-问题二：日前购电计划 + 日内因果 DP 执行
+问题二：日前购电计划 + 日内因果 DP 执行（跨日连续版本）
+
+关键修正：
+1. 日前LP不再强制日末SOC等于日初SOC
+2. 日前目标函数和日内DP均加入日末库存价值
+3. 相邻日期的SOC自动连续传递
 
 正式评价区间：
 2025-02-01 至 2025-12-31
@@ -260,12 +265,122 @@ def build_historical_scenarios(
     )
 
 
+def normalize_quantiles(
+    quantiles: list[float],
+    argument_name: str,
+) -> list[float]:
+    """检查并整理候选分位数。"""
+
+    values = sorted({float(value) for value in quantiles})
+
+    if not values:
+        raise ValueError(f"{argument_name}不能为空")
+
+    if any(value < 0.0 or value > 1.0 for value in values):
+        raise ValueError(
+            f"{argument_name}中的分位数必须在0和1之间"
+        )
+
+    return values
+
+
+def apply_forecast_safety_margin(
+    forecast_load: np.ndarray,
+    forecast_pv: np.ndarray,
+    scenario_load: np.ndarray,
+    scenario_pv: np.ndarray,
+    load_safety_factor: float,
+    pv_safety_factor: float,
+):
+    """
+    对预测和场景做保守修正：
+    负荷上调，光伏下调，以降低净负荷被低估的风险。
+    """
+
+    adjusted_forecast_load = np.maximum(
+        forecast_load * load_safety_factor,
+        0.0,
+    )
+    adjusted_forecast_pv = np.maximum(
+        forecast_pv * pv_safety_factor,
+        0.0,
+    )
+    adjusted_scenario_load = np.maximum(
+        scenario_load * load_safety_factor,
+        0.0,
+    )
+    adjusted_scenario_pv = np.maximum(
+        scenario_pv * pv_safety_factor,
+        0.0,
+    )
+
+    return (
+        adjusted_forecast_load,
+        adjusted_forecast_pv,
+        adjusted_scenario_load,
+        adjusted_scenario_pv,
+    )
+
+
+def select_dynamic_quantiles(
+    recent_daily_rows: list[dict],
+    normal_quantiles: list[float],
+    high_risk_quantiles: list[float],
+    lookback_days: int,
+    emergency_threshold_kwh: float,
+    net_error_threshold_kwh: float,
+) -> tuple[list[float], str, str]:
+    """
+    根据近期执行结果动态选择日前购电分位数。
+
+    近期出现明显临时购电或净负荷正向误差时，
+    后续日期使用更高分位数，降低继续买少的风险。
+    """
+
+    if lookback_days <= 0 or not recent_daily_rows:
+        return normal_quantiles, "常规", "无近期记录"
+
+    recent_rows = recent_daily_rows[-lookback_days:]
+
+    emergency_days = [
+        row
+        for row in recent_rows
+        if row["emergency_purchase_kwh"]
+        >= emergency_threshold_kwh
+    ]
+    positive_error_days = [
+        row
+        for row in recent_rows
+        if row["net_load_positive_error_kwh"]
+        >= net_error_threshold_kwh
+    ]
+
+    if emergency_days or positive_error_days:
+        reasons = []
+
+        if emergency_days:
+            reasons.append(
+                f"近{lookback_days}天出现"
+                f"{len(emergency_days)}天临时购电偏高"
+            )
+
+        if positive_error_days:
+            reasons.append(
+                f"近{lookback_days}天出现"
+                f"{len(positive_error_days)}天净负荷低估"
+            )
+
+        return high_risk_quantiles, "高风险", "，".join(reasons)
+
+    return normal_quantiles, "常规", "近期误差可控"
+
+
 def solve_day_ahead_lp(
     target_net_load: np.ndarray,
     price: np.ndarray,
     soc_start: float,
+    storage_value: float,
     params: StorageParams,
-    terminal_equal_start: bool = True,
 ) -> dict:
     """
     根据目标净负荷求解日前线性规划。
@@ -280,7 +395,11 @@ def solve_day_ahead_lp(
 
     目标：
 
-        最小化日前购电费用。
+        最小化 (日前购电费用 - 日末库存价值)
+
+    关键修正：
+    1. 不再强制 s_T = s_0
+    2. 目标函数中加入日末SOC的价值项 -storage_value * s_T
     """
 
     time_count = len(target_net_load)
@@ -294,6 +413,8 @@ def solve_day_ahead_lp(
 
     objective = np.zeros(variable_count)
     objective[index_g] = price
+    # 日末库存价值（负号表示这是收益）
+    objective[index_s.start + time_count - 1] = -storage_value
 
     equality_rows = []
     equality_rhs = []
@@ -336,19 +457,6 @@ def solve_day_ahead_lp(
         equality_rows.append(row)
         equality_rhs.append(right_side)
 
-    # 为保证每天的日前计划不会无代价透支储能，
-    # 保留原模型中的日末SOC等于日初SOC约束。
-    #
-    # 注意：这表示每个正式评价日单独闭合。
-    # 如果后续要严格建立跨日连续储能模型，
-    # 需要改成全年联立优化或加入终端储能价值函数。
-    if terminal_equal_start:
-        row = np.zeros(variable_count)
-        row[index_s.start + time_count - 1] = 1.0
-
-        equality_rows.append(row)
-        equality_rhs.append(soc_start)
-
     bounds = []
 
     # g_t >= 0
@@ -387,8 +495,16 @@ def solve_day_ahead_lp(
 
     solution = result.x
 
+    # 提取日末SOC
+    terminal_soc = solution[index_s.start + time_count - 1]
+
+    # 纯购电费用（不含库存价值）
+    pure_purchase_cost = float(np.sum(price * solution[index_g]))
+
     return {
-        "cost": float(result.fun),
+        "objective_value": float(result.fun),
+        "pure_purchase_cost": pure_purchase_cost,
+        "terminal_soc": float(terminal_soc),
         "planned_purchase": solution[index_g],
         "planned_charge": solution[index_c],
         "planned_discharge": solution[index_r],
@@ -477,13 +593,17 @@ def compute_dp_value(
     psi: np.ndarray,
     feasible: np.ndarray,
     emergency_multiplier: float,
+    storage_value: float,
 ) -> np.ndarray:
     """
     计算因果DP未来价值函数。
 
     F[t,i]表示：
     第t个时段开始、SOC为grid[i]时，
-    从t到当天结束的最低期望临时购电费用。
+    从t到当天结束的最低期望临时购电费用（减去日末库存价值）。
+
+    关键修正：
+    终端价值函数从0改为 -storage_value * s
     """
 
     time_count = len(planned_purchase)
@@ -493,6 +613,9 @@ def compute_dp_value(
         (time_count + 1, state_count),
         dtype=float,
     )
+
+    # 终端价值：日末库存价值
+    future_value[time_count] = -storage_value * grid
 
     for t in range(time_count - 1, -1, -1):
 
@@ -674,6 +797,7 @@ def build_detail_rows(
         rows.append(
             {
                 "date": current_date,
+                "slot_index": t,
                 "time": str(label),
                 "price_yuan_per_kwh": price[t],
                 "load_kwh": load_energy[t],
@@ -832,7 +956,7 @@ def plot_results(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="问题二：日前LP + 日内因果DP"
+        description="问题二：日前LP + 日内因果DP（跨日连续版本）"
     )
 
     parser.add_argument(
@@ -870,9 +994,62 @@ def main():
         nargs="+",
         default=[0.75],
         help=(
-            "日前LP使用的净负荷分位数；"
+            "常规状态下日前LP使用的净负荷分位数；"
             "多个值会逐个试算并选择估计费用最低者"
         ),
+    )
+
+    parser.add_argument(
+        "--high-risk-quantiles",
+        type=float,
+        nargs="+",
+        default=[0.85, 0.90, 0.95],
+        help=(
+            "近期出现明显临时购电或净负荷低估时使用的"
+            "高风险净负荷分位数"
+        ),
+    )
+
+    parser.add_argument(
+        "--load-safety-factor",
+        type=float,
+        default=1.05,
+        help="日前预测中负荷的安全上调系数，默认1.05",
+    )
+
+    parser.add_argument(
+        "--pv-safety-factor",
+        type=float,
+        default=0.90,
+        help="日前预测中光伏的安全下调系数，默认0.90",
+    )
+
+    parser.add_argument(
+        "--dynamic-quantile-lookback",
+        type=int,
+        default=3,
+        help="动态分位数判断时回看最近多少个正式评价日",
+    )
+
+    parser.add_argument(
+        "--dynamic-emergency-threshold",
+        type=float,
+        default=1000.0,
+        help="触发高风险分位数的近期单日临时购电量阈值(kWh)",
+    )
+
+    parser.add_argument(
+        "--dynamic-net-error-threshold",
+        type=float,
+        default=5000.0,
+        help="触发高风险分位数的近期单日净负荷低估阈值(kWh)",
+    )
+
+    parser.add_argument(
+        "--storage-value",
+        type=float,
+        default=0.481548,
+        help="日末库存价值系数（元/kWh），参考论文取值",
     )
 
     parser.add_argument(
@@ -899,13 +1076,36 @@ def main():
     if args.max_scenarios <= 0:
         raise ValueError("--max-scenarios必须为正整数")
 
-    if any(
-        q < 0.0 or q > 1.0
-        for q in args.candidate_quantiles
+    normal_quantiles = normalize_quantiles(
+        args.candidate_quantiles,
+        "--candidate-quantiles",
+    )
+
+    high_risk_quantiles = normalize_quantiles(
+        args.high_risk_quantiles,
+        "--high-risk-quantiles",
+    )
+
+    if args.storage_value < 0:
+        raise ValueError("--storage-value不能为负数")
+
+    if args.load_safety_factor < 1.0:
+        raise ValueError("--load-safety-factor不能小于1")
+
+    if (
+        args.pv_safety_factor < 0.0
+        or args.pv_safety_factor > 1.0
     ):
-        raise ValueError(
-            "--candidate-quantiles中的分位数必须在0和1之间"
-        )
+        raise ValueError("--pv-safety-factor必须在0和1之间")
+
+    if args.dynamic_quantile_lookback < 0:
+        raise ValueError("--dynamic-quantile-lookback不能为负数")
+
+    if args.dynamic_emergency_threshold < 0:
+        raise ValueError("--dynamic-emergency-threshold不能为负数")
+
+    if args.dynamic_net_error_threshold < 0:
+        raise ValueError("--dynamic-net-error-threshold不能为负数")
 
     params = StorageParams()
     emergency_multiplier = 5.0
@@ -1053,6 +1253,23 @@ def main():
         f"{len(excluded_dates)}天"
     )
 
+    print(
+        f"日末库存价值系数："
+        f"{args.storage_value:.6f} 元/kWh"
+    )
+
+    print(
+        "预测安全修正："
+        f"负荷×{args.load_safety_factor:.3f}，"
+        f"光伏×{args.pv_safety_factor:.3f}"
+    )
+
+    print(
+        "动态分位数："
+        f"常规{normal_quantiles}，"
+        f"高风险{high_risk_quantiles}"
+    )
+
     # =====================================================
     # 4. 参数计算
     # =====================================================
@@ -1095,13 +1312,44 @@ def main():
             max_scenarios=args.max_scenarios,
         )
 
+        (
+            forecast_load,
+            forecast_pv,
+            scenario_load,
+            scenario_pv,
+        ) = apply_forecast_safety_margin(
+            forecast_load=forecast_load,
+            forecast_pv=forecast_pv,
+            scenario_load=scenario_load,
+            scenario_pv=scenario_pv,
+            load_safety_factor=args.load_safety_factor,
+            pv_safety_factor=args.pv_safety_factor,
+        )
+
         scenario_net_load = (
             scenario_load - scenario_pv
         )
 
+        active_quantiles, risk_mode, risk_reason = (
+            select_dynamic_quantiles(
+                recent_daily_rows=daily_rows,
+                normal_quantiles=normal_quantiles,
+                high_risk_quantiles=high_risk_quantiles,
+                lookback_days=(
+                    args.dynamic_quantile_lookback
+                ),
+                emergency_threshold_kwh=(
+                    args.dynamic_emergency_threshold
+                ),
+                net_error_threshold_kwh=(
+                    args.dynamic_net_error_threshold
+                ),
+            )
+        )
+
         best_solution = None
 
-        for quantile in args.candidate_quantiles:
+        for quantile in active_quantiles:
 
             target_net_load = np.quantile(
                 scenario_net_load,
@@ -1113,8 +1361,8 @@ def main():
                 target_net_load=target_net_load,
                 price=price[day_index],
                 soc_start=soc_start,
+                storage_value=args.storage_value,
                 params=params,
-                terminal_equal_start=True,
             )
 
             future_value = compute_dp_value(
@@ -1134,6 +1382,7 @@ def main():
                 emergency_multiplier=(
                     emergency_multiplier
                 ),
+                storage_value=args.storage_value,
             )
 
             start_state_index = nearest_grid_index(
@@ -1141,18 +1390,23 @@ def main():
                 soc_start,
             )
 
+            # 估计的总成本 = LP目标值（已包含库存价值）+ DP期望紧急购电费用
             estimated_total_cost = (
-                lp_solution["cost"]
+                lp_solution["objective_value"]
                 + future_value[
                     0,
                     start_state_index,
                 ]
+                + args.storage_value * soc_start  # 补偿起始库存价值
             )
 
             candidate_solution = {
                 "quantile": quantile,
                 "lp_solution": lp_solution,
                 "future_value": future_value,
+                "target_net_load_sum": float(
+                    np.sum(target_net_load)
+                ),
                 "estimated_total_cost": float(
                     estimated_total_cost
                 ),
@@ -1200,6 +1454,24 @@ def main():
             ),
         )
 
+        actual_net_load_sum = float(
+            np.sum(actual_net_load)
+        )
+        forecast_load_sum = float(
+            np.sum(forecast_load)
+        )
+        forecast_pv_sum = float(
+            np.sum(forecast_pv)
+        )
+        forecast_net_load_sum = (
+            forecast_load_sum - forecast_pv_sum
+        )
+        net_load_positive_error = max(
+            actual_net_load_sum
+            - best_solution["target_net_load_sum"],
+            0.0,
+        )
+
         detail_rows.extend(
             build_detail_rows(
                 current_date=current_date,
@@ -1219,11 +1491,31 @@ def main():
         daily_rows.append(
             {
                 "date": current_date,
+                "risk_mode": risk_mode,
+                "risk_reason": risk_reason,
+                "active_quantiles": ",".join(
+                    f"{quantile:.2f}"
+                    for quantile in active_quantiles
+                ),
                 "selected_quantile": best_solution[
                     "quantile"
                 ],
                 "scenario_count": len(
                     scenario_probability
+                ),
+                "forecast_load_kwh": forecast_load_sum,
+                "forecast_pv_kwh": forecast_pv_sum,
+                "forecast_net_load_kwh": (
+                    forecast_net_load_sum
+                ),
+                "target_net_load_kwh": best_solution[
+                    "target_net_load_sum"
+                ],
+                "actual_net_load_kwh": (
+                    actual_net_load_sum
+                ),
+                "net_load_positive_error_kwh": (
+                    net_load_positive_error
                 ),
                 "soc_start_kwh": soc_start,
                 "soc_end_kwh": execution[
@@ -1259,6 +1551,7 @@ def main():
             }
         )
 
+        # 跨日SOC连续传递
         soc_start = float(
             execution["soc"][-1]
         )
@@ -1267,6 +1560,7 @@ def main():
 
         print(
             f"{current_date}完成 | "
+            f"{risk_mode} | "
             f"q={best_solution['quantile']:.2f} | "
             f"SOC："
             f"{latest_day['soc_start_kwh']:.1f}"
@@ -1375,10 +1669,6 @@ def main():
         / "problem2_daily_summary.csv"
     )
 
-    excel_path = (
-        output_dir / "problem2_results.xlsx"
-    )
-
     detail.to_csv(
         detail_path,
         index=False,
@@ -1391,48 +1681,12 @@ def main():
         encoding="utf-8-sig",
     )
 
-    with pd.ExcelWriter(
-        excel_path,
-        engine="openpyxl",
-    ) as writer:
-
-        daily_summary.to_excel(
-            writer,
-            sheet_name="daily_summary",
-            index=False,
-        )
-
-        detail.to_excel(
-            writer,
-            sheet_name="detail",
-            index=False,
-        )
-
-        pd.DataFrame(
-            {
-                "项目": [
-                    "正式评价开始日期",
-                    "正式评价结束日期",
-                    "正式评价天数",
-                    "未纳入评价的预热天数",
-                    "说明",
-                ],
-                "值": [
-                    daily_summary["date"].iloc[0],
-                    daily_summary["date"].iloc[-1],
-                    len(daily_summary),
-                    len(excluded_dates),
-                    (
-                        "2025-01-01不进入正式评价，"
-                        "也不进入残差场景库"
-                    ),
-                ],
-            }
-        ).to_excel(
-            writer,
-            sheet_name="calculation_info",
-            index=False,
-        )
+    submission_path = generate_submission_tables(
+        detail=detail,
+        daily_summary=daily_summary,
+        time_labels=time_labels,
+        output_dir=output_dir,
+    )
 
     total_normal_cost = float(
         daily_summary[
@@ -1473,6 +1727,10 @@ def main():
         f"{len(excluded_dates)}"
     )
     print(
+        f"日末库存价值系数："
+        f"{args.storage_value:.6f} 元/kWh"
+    )
+    print(
         f"计划购电费用："
         f"{total_normal_cost:.2f} 元"
     )
@@ -1490,8 +1748,424 @@ def main():
     )
     print(f"结果明细：{detail_path}")
     print(f"每日汇总：{daily_path}")
-    print(f"Excel结果：{excel_path}")
+    print(f"提交表格：{submission_path}")
+    print("包含三张表：")
+    print("  1. 计划购电量（日期×144时段）")
+    print("  2. 充放电量（6个4小时时段）")
+    print("  3. 紧急购电量（日期、购电时间段、购电量）")
 
+def format_clock_label(
+    total_minutes: int,
+    mark_next_day: bool = False,
+) -> str:
+    """生成类似 0:10 或 0:10+1 的时刻标签。"""
+
+    minutes_in_day = 24 * 60
+    wrapped_minutes = total_minutes % minutes_in_day
+    hour, minute = divmod(wrapped_minutes, 60)
+    label = f"{hour}:{minute:02d}"
+
+    if mark_next_day and total_minutes >= minutes_in_day:
+        label += "+1"
+
+    return label
+
+
+def make_10min_interval_label(slot_index: int) -> str:
+    """按附件5示意格式生成第slot_index个10分钟购电时段。"""
+
+    start_minute = (slot_index + 1) * 10
+    end_minute = start_minute + 10
+
+    return (
+        f"{format_clock_label(start_minute)}-"
+        f"{format_clock_label(end_minute, mark_next_day=True)}"
+    )
+
+
+def make_slot_range_label(
+    start_slot: int,
+    end_slot: int,
+) -> str:
+    """把连续10分钟时段合并成一个购电时间段标签。"""
+
+    start_minute = (start_slot + 1) * 10
+    end_minute = (end_slot + 2) * 10
+
+    return (
+        f"{format_clock_label(start_minute)}-"
+        f"{format_clock_label(end_minute, mark_next_day=True)}"
+    )
+
+
+def build_emergency_purchase_table(
+    detail: pd.DataFrame,
+    dates,
+    threshold: float = 1e-6,
+) -> pd.DataFrame:
+    """生成紧急购电量表，连续时段合并为一行。"""
+
+    positive_detail = (
+        detail[detail["emergency_purchase_kwh"] > threshold]
+        .copy()
+        .sort_values(["date", "slot_index"])
+    )
+
+    rows = []
+
+    for current_date in dates:
+        day_detail = positive_detail[
+            positive_detail["date"] == current_date
+        ]
+
+        if day_detail.empty:
+            rows.append(
+                {
+                    "日期": current_date,
+                    "购电时间段": None,
+                    "购电量": None,
+                }
+            )
+            continue
+
+        first_row_for_date = True
+        start_slot = None
+        end_slot = None
+        purchase_amount = 0.0
+
+        for _, row in day_detail.iterrows():
+            slot_index = int(row["slot_index"])
+            amount = float(row["emergency_purchase_kwh"])
+
+            if start_slot is None:
+                start_slot = slot_index
+                end_slot = slot_index
+                purchase_amount = amount
+                continue
+
+            if slot_index == end_slot + 1:
+                end_slot = slot_index
+                purchase_amount += amount
+                continue
+
+            rows.append(
+                {
+                    "日期": (
+                        current_date
+                        if first_row_for_date
+                        else None
+                    ),
+                    "购电时间段": make_slot_range_label(
+                        start_slot,
+                        end_slot,
+                    ),
+                    "购电量": purchase_amount,
+                }
+            )
+            first_row_for_date = False
+            start_slot = slot_index
+            end_slot = slot_index
+            purchase_amount = amount
+
+        rows.append(
+            {
+                "日期": (
+                    current_date
+                    if first_row_for_date
+                    else None
+                ),
+                "购电时间段": make_slot_range_label(
+                    start_slot,
+                    end_slot,
+                ),
+                "购电量": purchase_amount,
+            }
+        )
+
+    return pd.DataFrame(
+        rows,
+        columns=["日期", "购电时间段", "购电量"],
+    )
+
+
+def build_storage_table(
+    detail: pd.DataFrame,
+    daily_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    """生成每天6个4小时时段的储能充放电量表。"""
+
+    four_hour_periods = [
+        "0:00-4:00",
+        "4:00-8:00",
+        "8:00-12:00",
+        "12:00-16:00",
+        "16:00-20:00",
+        "20:00-24:00",
+    ]
+
+    detail_with_period = detail.copy()
+    detail_with_period["period_idx"] = (
+        detail_with_period["slot_index"].astype(int) // 24
+    )
+
+    storage_summary = (
+        detail_with_period.groupby(
+            ["date", "period_idx"],
+            as_index=False,
+        )
+        .agg(
+            charge_kwh=("charge_kwh", "sum"),
+            discharge_kwh=("discharge_kwh", "sum"),
+        )
+    )
+
+    storage_lookup = {
+        (row["date"], int(row["period_idx"])): row
+        for _, row in storage_summary.iterrows()
+    }
+
+    rows = []
+
+    for _, day_row in daily_summary.iterrows():
+        current_date = day_row["date"]
+
+        for period_idx, period_label in enumerate(four_hour_periods):
+            storage_row = storage_lookup.get(
+                (current_date, period_idx)
+            )
+
+            if storage_row is None:
+                charge_amount = 0.0
+                discharge_amount = 0.0
+            else:
+                charge_amount = float(
+                    storage_row["charge_kwh"]
+                )
+                discharge_amount = float(
+                    storage_row["discharge_kwh"]
+                )
+
+            if period_idx == 0:
+                time_mark = "0:00"
+                soc_value = day_row["soc_start_kwh"]
+            elif period_idx == 1:
+                time_mark = "24:00"
+                soc_value = day_row["soc_end_kwh"]
+            else:
+                time_mark = None
+                soc_value = None
+
+            rows.append(
+                {
+                    "日期": (
+                        current_date
+                        if period_idx == 0
+                        else None
+                    ),
+                    "时间段": period_label,
+                    "充电量": charge_amount,
+                    "放电量": discharge_amount,
+                    "时刻": time_mark,
+                    "储电量": soc_value,
+                }
+            )
+
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "日期",
+            "时间段",
+            "充电量",
+            "放电量",
+            "时刻",
+            "储电量",
+        ],
+    )
+
+
+def format_submission_workbook(
+    writer,
+    sheet_names: list[str],
+):
+    """按附件5示意表做基础格式整理。"""
+
+    from openpyxl.styles import Alignment, Border, Font, Side
+    from openpyxl.utils import get_column_letter
+
+    workbook = writer.book
+    thin_side = Side(style="thin", color="000000")
+    thin_border = Border(
+        left=thin_side,
+        right=thin_side,
+        top=thin_side,
+        bottom=thin_side,
+    )
+
+    for sheet_name in sheet_names:
+        worksheet = workbook[sheet_name]
+
+        for row in worksheet.iter_rows():
+            for cell in row:
+                cell.font = Font(name="宋体", size=10)
+                cell.alignment = Alignment(
+                    horizontal="center",
+                    vertical="center",
+                )
+
+        for cell in worksheet[1]:
+            cell.border = thin_border
+
+        worksheet.row_dimensions[1].height = 22
+
+    planned_sheet = workbook["计划购电量"]
+    planned_sheet.column_dimensions["A"].width = 12
+
+    for col_idx in range(2, planned_sheet.max_column + 1):
+        planned_sheet.column_dimensions[
+            get_column_letter(col_idx)
+        ].width = 12
+
+    for row in planned_sheet.iter_rows(
+        min_row=2,
+        max_row=planned_sheet.max_row,
+    ):
+        row[0].number_format = "yyyy/m/d"
+        for cell in row[1:]:
+            cell.number_format = "0.00"
+
+    storage_sheet = workbook["充放电量"]
+    for col_idx in range(1, storage_sheet.max_column + 1):
+        storage_sheet.column_dimensions[
+            get_column_letter(col_idx)
+        ].width = 12
+
+    for row in storage_sheet.iter_rows(
+        min_row=1,
+        max_row=storage_sheet.max_row,
+        max_col=storage_sheet.max_column,
+    ):
+        for cell in row:
+            cell.border = thin_border
+
+    for row in storage_sheet.iter_rows(
+        min_row=2,
+        max_row=storage_sheet.max_row,
+    ):
+        row[0].number_format = "yyyy/m/d"
+        row[2].number_format = "0.00"
+        row[3].number_format = "0.00"
+        row[5].number_format = "0.00"
+
+    emergency_sheet = workbook["紧急购电量"]
+    for col_idx in range(1, emergency_sheet.max_column + 1):
+        emergency_sheet.column_dimensions[
+            get_column_letter(col_idx)
+        ].width = 14
+
+    for row in emergency_sheet.iter_rows(
+        min_row=1,
+        max_row=emergency_sheet.max_row,
+        max_col=emergency_sheet.max_column,
+    ):
+        for cell in row:
+            cell.border = thin_border
+
+    for row in emergency_sheet.iter_rows(
+        min_row=2,
+        max_row=emergency_sheet.max_row,
+    ):
+        row[0].number_format = "yyyy/m/d"
+        row[2].number_format = "0.00"
+
+
+def generate_submission_tables(
+    detail: pd.DataFrame,
+    daily_summary: pd.DataFrame,
+    time_labels: list,
+    output_dir: Path,
+):
+    """
+    生成附件5格式的result2.xlsx，包含三张表：
+    1. 计划购电量：日期、144个10分钟时段、全天购电量、全天购电费。
+    2. 充放电量：每天6个4小时时段的充电量和放电量。
+    3. 紧急购电量：按日期汇总连续紧急购电时段和购电量。
+    """
+
+    dates = list(daily_summary["date"])
+    interval_labels = [
+        make_10min_interval_label(slot_index)
+        for slot_index in range(len(time_labels))
+    ]
+
+    planned_purchase_wide = detail.pivot(
+        index="date",
+        columns="slot_index",
+        values="planned_purchase_kwh",
+    )
+    planned_purchase_wide = planned_purchase_wide.reindex(
+        index=dates,
+        columns=range(len(time_labels)),
+    )
+    planned_purchase_wide.columns = interval_labels
+    planned_purchase_wide.index.name = "日期\\时间"
+
+    daily_lookup = daily_summary.set_index("date")
+    planned_purchase_wide["全天购电量"] = daily_lookup.loc[
+        planned_purchase_wide.index,
+        "planned_purchase_kwh",
+    ].to_numpy()
+    planned_purchase_wide["全天购电费"] = daily_lookup.loc[
+        planned_purchase_wide.index,
+        "normal_cost_yuan",
+    ].to_numpy()
+
+    storage_table = build_storage_table(
+        detail=detail,
+        daily_summary=daily_summary,
+    )
+
+    emergency_table = build_emergency_purchase_table(
+        detail=detail,
+        dates=dates,
+    )
+
+    submission_path = output_dir / "result2.xlsx"
+    sheet_names = [
+        "计划购电量",
+        "充放电量",
+        "紧急购电量",
+    ]
+
+    with pd.ExcelWriter(
+        submission_path,
+        engine="openpyxl",
+        date_format="yyyy/m/d",
+        datetime_format="yyyy/m/d",
+    ) as writer:
+        planned_purchase_wide.to_excel(
+            writer,
+            sheet_name=sheet_names[0],
+            index=True,
+        )
+
+        storage_table.to_excel(
+            writer,
+            sheet_name=sheet_names[1],
+            index=False,
+        )
+
+        emergency_table.to_excel(
+            writer,
+            sheet_name=sheet_names[2],
+            index=False,
+        )
+
+        format_submission_workbook(
+            writer=writer,
+            sheet_names=sheet_names,
+        )
+
+    return submission_path
 
 if __name__ == "__main__":
     main()
