@@ -5,6 +5,9 @@
 1. 日前LP不再强制日末SOC等于日初SOC
 2. 日前目标函数和日内DP均加入日末库存价值
 3. 相邻日期的SOC自动连续传递
+4. 日前预测改为“日总量 + 日内形状”分解
+5. 负荷预测优先使用最近同类型日修正
+6. 分位数由最近历史误差滚动校准
 
 正式评价区间：
 2025-02-01 至 2025-12-31
@@ -16,7 +19,7 @@ python solve_problem2.py --candidate-quantiles 0.6 0.75 0.9
 python solve_problem2.py --soc-step 500
 
 输出目录：
-C:/Users/LENOVO/Desktop/数模/C题/outputs/problem2/
+C:/Users/LENOVO/Desktop/数模/C题/outputs/problem2_same_type_forecast/
 """
 
 from __future__ import annotations
@@ -188,12 +191,223 @@ def check_input_data(
             )
 
 
+def get_date_value(
+    all_dates: pd.Series | np.ndarray | list,
+    index: int,
+) -> pd.Timestamp:
+    """兼容Series、数组和列表的日期读取。"""
+
+    if hasattr(all_dates, "iloc"):
+        value = all_dates.iloc[index]
+    else:
+        value = all_dates[index]
+
+    return pd.Timestamp(value)
+
+
+def make_recency_weights(
+    history_indices: np.ndarray,
+    day_index: int,
+    recency_decay: float,
+) -> np.ndarray:
+    """
+    生成时间衰减权重。
+
+    距离预测日越近的历史日权重越大；
+    recency_decay=1时退化为等权平均。
+    """
+
+    ages = np.maximum(
+        day_index - history_indices,
+        1,
+    ).astype(float)
+    weights = recency_decay ** (ages - 1.0)
+    weights_sum = weights.sum()
+
+    if weights_sum <= 0:
+        return np.full(
+            len(history_indices),
+            1.0 / len(history_indices),
+        )
+
+    return weights / weights_sum
+
+
+def select_similar_history_indices(
+    all_dates: pd.Series | np.ndarray | list | None,
+    day_index: int,
+    max_scenarios: int,
+    min_similar_days: int,
+) -> np.ndarray:
+    """
+    为预测日选择最近同类型历史日。
+
+    优先级：
+    1. 同一星期几；
+    2. 同为工作日或同为周末；
+    3. 最近全部历史日。
+
+    这些类型只由日期决定，因此不会使用未来真实负荷。
+    """
+
+    history_start = max(1, day_index - max_scenarios)
+    history_indices = np.arange(
+        history_start,
+        day_index,
+        dtype=int,
+    )
+
+    if len(history_indices) == 0:
+        raise ValueError(
+            f"第{day_index}天之前没有可用历史数据"
+        )
+
+    if all_dates is None:
+        return history_indices
+
+    current_date = get_date_value(all_dates, day_index)
+    current_weekday = current_date.weekday()
+    current_is_weekend = current_weekday >= 5
+
+    same_weekday = np.array(
+        [
+            idx
+            for idx in history_indices
+            if get_date_value(all_dates, int(idx)).weekday()
+            == current_weekday
+        ],
+        dtype=int,
+    )
+
+    if len(same_weekday) >= min_similar_days:
+        return same_weekday
+
+    same_workday_type = np.array(
+        [
+            idx
+            for idx in history_indices
+            if (
+                get_date_value(all_dates, int(idx)).weekday()
+                >= 5
+            )
+            == current_is_weekend
+        ],
+        dtype=int,
+    )
+
+    if len(same_workday_type) >= min_similar_days:
+        return same_workday_type
+
+    return history_indices
+
+
+def normalize_profiles(
+    values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    把每天的144个时段曲线拆成日总量和日内形状。
+
+    日内形状的每一行加总为1；日总量为0时，
+    对应形状置为0，避免除零。
+    """
+
+    daily_totals = values.sum(axis=1)
+    profiles = np.divide(
+        values,
+        daily_totals[:, None],
+        out=np.zeros_like(values),
+        where=daily_totals[:, None] > 1e-12,
+    )
+
+    return daily_totals, profiles
+
+
+def estimate_same_type_daily_total(
+    daily_totals: np.ndarray,
+    history_indices: np.ndarray,
+    weights: np.ndarray,
+    day_index: int,
+    daily_trend_clip: float,
+) -> float:
+    """
+    用同类型日估计预测日的日总量。
+
+    若同类型历史日足够多，则用相邻同类型日之间的
+    中位增长率外推到预测日；若样本太少，则退回到
+    时间衰减加权平均。
+    """
+
+    selected_totals = daily_totals[history_indices]
+    weighted_average_total = float(
+        np.average(
+            selected_totals,
+            weights=weights,
+        )
+    )
+
+    if len(history_indices) < 2:
+        return weighted_average_total
+
+    growth_rates = []
+
+    for previous_index, current_index in zip(
+        history_indices[:-1],
+        history_indices[1:],
+    ):
+        previous_total = daily_totals[previous_index]
+        current_total = daily_totals[current_index]
+
+        if previous_total <= 1e-12 or current_total <= 1e-12:
+            continue
+
+        day_gap = max(
+            int(current_index - previous_index),
+            1,
+        )
+        growth_rates.append(
+            np.log(current_total / previous_total) / day_gap
+        )
+
+    if not growth_rates:
+        return weighted_average_total
+
+    median_growth = float(np.median(growth_rates))
+    forecast_gap = max(
+        int(day_index - history_indices[-1]),
+        1,
+    )
+    trend_exponent = median_growth * forecast_gap
+
+    if daily_trend_clip > 0:
+        trend_exponent = float(
+            np.clip(
+                trend_exponent,
+                -daily_trend_clip,
+                daily_trend_clip,
+            )
+        )
+
+    trend_total = float(
+        daily_totals[history_indices[-1]]
+        * np.exp(trend_exponent)
+    )
+
+    if not np.isfinite(trend_total) or trend_total < 0:
+        return weighted_average_total
+
+    return trend_total
+
+
 def build_historical_scenarios(
     load_energy: np.ndarray,
     pv_energy: np.ndarray,
+    all_dates: pd.Series | np.ndarray | list | None,
     day_index: int,
     max_scenarios: int,
     recency_decay: float,
+    min_similar_days: int,
+    daily_trend_clip: float,
+    pv_recent_days: int,
 ):
     """
     根据当前日前可获得的历史数据构造预测和场景。
@@ -203,8 +417,10 @@ def build_historical_scenarios(
     1. 只能使用当前日之前的数据；
     2. 2025年1月1日不进入正式评价；
     3. 2025年1月1日没有历史预测，因此不进入残差场景库；
-    4. 使用按时间衰减的逐时段加权均值作为预测，越近的历史日权重越大；
-    5. 历史日相对于历史均值的整日残差作为场景，
+    4. 负荷预测拆成“日总量 + 日内形状”：
+       日总量由最近同类型日趋势估计，日内形状由同类型日加权平均；
+    5. 光伏预测同样拆成“日总量 + 日内形状”，但优先使用更近的短窗口；
+    6. 历史日相对于同类型基准曲线的整日残差作为场景，
        以保留一天内144个时段的共同波动结构。
     """
 
@@ -219,45 +435,52 @@ def build_historical_scenarios(
     if not 0.0 < recency_decay <= 1.0:
         raise ValueError("recency_decay必须大于0且不大于1")
 
-    # 索引0代表2025年1月1日。
-    # 由于1月1日没有历史预测，不将它放入残差场景库。
-    history_start = max(1, day_index - max_scenarios)
-    history_end = day_index
+    if min_similar_days <= 0:
+        raise ValueError("min_similar_days必须为正数")
 
-    historical_load = load_energy[history_start:history_end]
-    historical_pv = pv_energy[history_start:history_end]
+    if pv_recent_days <= 0:
+        raise ValueError("pv_recent_days必须为正数")
 
-    if historical_load.shape[0] == 0:
-        raise ValueError(
-            f"第{day_index}天之前没有可用历史数据"
-        )
+    # =====================================================
+    # 1. 负荷预测：同类型日的日总量 + 日内形状
+    # =====================================================
 
-    # 最近历史日权重最大；recency_decay=1时退化为等权平均。
-    history_count = historical_load.shape[0]
-    recency_weights = recency_decay ** np.arange(
-        history_count - 1,
-        -1,
-        -1,
-        dtype=float,
+    load_history_indices = select_similar_history_indices(
+        all_dates=all_dates,
+        day_index=day_index,
+        max_scenarios=max_scenarios,
+        min_similar_days=min_similar_days,
     )
-    recency_weights /= recency_weights.sum()
 
-    # 负荷先预测日总量，再预测归一化的日内曲线，避免总量和形状相互污染。
-    historical_load_totals = historical_load.sum(axis=1)
-    load_profiles = np.divide(
-        historical_load,
-        historical_load_totals[:, None],
-        out=np.zeros_like(historical_load),
-        where=historical_load_totals[:, None] > 1e-12,
+    load_weights = make_recency_weights(
+        history_indices=load_history_indices,
+        day_index=day_index,
+        recency_decay=recency_decay,
     )
+
+    all_load_totals = load_energy.sum(axis=1)
+    historical_load = load_energy[load_history_indices]
+    historical_load_totals, load_profiles = normalize_profiles(
+        historical_load
+    )
+
     forecast_load_total = np.average(
         historical_load_totals,
-        weights=recency_weights,
+        weights=load_weights,
     )
+
+    forecast_load_total = estimate_same_type_daily_total(
+        daily_totals=all_load_totals,
+        history_indices=load_history_indices,
+        weights=load_weights,
+        day_index=day_index,
+        daily_trend_clip=daily_trend_clip,
+    )
+
     forecast_load_profile = np.average(
         load_profiles,
         axis=0,
-        weights=recency_weights,
+        weights=load_weights,
     )
     forecast_load_profile /= max(
         forecast_load_profile.sum(),
@@ -266,18 +489,80 @@ def build_historical_scenarios(
     forecast_load = (
         forecast_load_total * forecast_load_profile
     )
-    forecast_pv = np.average(
-        historical_pv,
-        axis=0,
-        weights=recency_weights,
+
+    baseline_load_total = float(
+        np.average(
+            historical_load_totals,
+            weights=load_weights,
+        )
+    )
+    baseline_load = baseline_load_total * forecast_load_profile
+
+    # =====================================================
+    # 2. 光伏预测：最近短窗口的日总量 + 日内形状
+    # =====================================================
+
+    pv_history_start = max(
+        1,
+        day_index - min(max_scenarios, pv_recent_days),
+    )
+    pv_history_indices = np.arange(
+        pv_history_start,
+        day_index,
+        dtype=int,
     )
 
-    # 历史日相对加权预测的整日残差。
-    historical_load_mean = forecast_load
-    historical_pv_mean = forecast_pv
+    if len(pv_history_indices) == 0:
+        pv_history_indices = load_history_indices
 
-    load_residual = historical_load - historical_load_mean
-    pv_residual = historical_pv - historical_pv_mean
+    pv_weights = make_recency_weights(
+        history_indices=pv_history_indices,
+        day_index=day_index,
+        recency_decay=recency_decay,
+    )
+
+    historical_pv_for_forecast = pv_energy[pv_history_indices]
+    historical_pv_totals, pv_profiles = normalize_profiles(
+        historical_pv_for_forecast
+    )
+
+    forecast_pv_total = float(
+        np.average(
+            historical_pv_totals,
+            weights=pv_weights,
+        )
+    )
+    forecast_pv_profile = np.average(
+        pv_profiles,
+        axis=0,
+        weights=pv_weights,
+    )
+    forecast_pv_profile /= max(
+        forecast_pv_profile.sum(),
+        1e-12,
+    )
+    forecast_pv = np.average(
+        historical_pv_for_forecast,
+        axis=0,
+        weights=pv_weights,
+    )
+
+    if forecast_pv_profile.sum() > 1e-12:
+        forecast_pv = forecast_pv_total * forecast_pv_profile
+
+    # =====================================================
+    # 3. 场景构造：同类型历史日的整日残差
+    # =====================================================
+
+    historical_pv = pv_energy[load_history_indices]
+    baseline_pv = np.average(
+        historical_pv,
+        axis=0,
+        weights=load_weights,
+    )
+
+    load_residual = historical_load - baseline_load
+    pv_residual = historical_pv - baseline_pv
 
     # 将历史残差叠加到当前预测上，构造未来可能出现的整日场景。
     scenario_load = np.maximum(
@@ -291,7 +576,9 @@ def build_historical_scenarios(
     )
 
     # 历史全部无光伏的时段视为夜间，预测和场景都强制为零。
-    night_slots = np.all(historical_pv <= 1e-12, axis=0)
+    history_start = max(1, day_index - max_scenarios)
+    recent_pv = pv_energy[history_start:day_index]
+    night_slots = np.all(recent_pv <= 1e-12, axis=0)
     forecast_pv[night_slots] = 0.0
     scenario_pv[:, night_slots] = 0.0
 
@@ -494,7 +781,7 @@ def select_dynamic_quantiles(
 
 def select_rolling_optimal_quantile(
     current_day_index: int,
-    all_dates: np.ndarray,
+    all_dates: pd.Series | np.ndarray | list,
     load_energy: np.ndarray,
     pv_energy: np.ndarray,
     price: np.ndarray,
@@ -503,17 +790,15 @@ def select_rolling_optimal_quantile(
     min_history_days: int,
     max_scenarios: int,
     recency_decay: float,
+    min_similar_days: int,
+    daily_trend_clip: float,
+    pv_recent_days: int,
     load_safety_factor: float,
     pv_safety_factor: float,
     summer_pv_factor: float,
     emergency_multiplier: float,
-    storage_value: float,
-    params: StorageParams,
-    grid: np.ndarray,
-    psi: np.ndarray,
-    feasible: np.ndarray,
 ) -> tuple[float, str]:
-    """用最近历史日的完整 LP+DP 回测选择当前日前分位数。"""
+    """用最近历史日滚动回测选择当前日前分位数。"""
 
     history_start = max(2, current_day_index - lookback_days)
     history_indices = list(range(history_start, current_day_index))
@@ -524,10 +809,6 @@ def select_rolling_optimal_quantile(
         )
 
     scores = {quantile: [] for quantile in candidate_quantiles}
-    soc_starts = {
-        quantile: params.soc_initial
-        for quantile in candidate_quantiles
-    }
 
     for historical_day_index in history_indices:
         (
@@ -539,13 +820,17 @@ def select_rolling_optimal_quantile(
         ) = build_historical_scenarios(
             load_energy=load_energy,
             pv_energy=pv_energy,
+            all_dates=all_dates,
             day_index=historical_day_index,
             max_scenarios=max_scenarios,
             recency_decay=recency_decay,
+            min_similar_days=min_similar_days,
+            daily_trend_clip=daily_trend_clip,
+            pv_recent_days=pv_recent_days,
         )
 
         month = pd.Timestamp(
-            all_dates[historical_day_index]
+            get_date_value(all_dates, historical_day_index)
         ).month
         pv_factor = (
             summer_pv_factor
@@ -578,55 +863,28 @@ def select_rolling_optimal_quantile(
         )
         historical_price = price[historical_day_index]
 
-        scenario_probability = np.full(
-            scenario_net_load.shape[0],
-            1.0 / scenario_net_load.shape[0],
-        )
-
         for quantile in candidate_quantiles:
             target_net_load = np.quantile(
                 scenario_net_load,
                 quantile,
                 axis=0,
             )
-            lp_solution = solve_day_ahead_lp(
-                target_net_load=target_net_load,
-                price=historical_price,
-                soc_start=soc_starts[quantile],
-                storage_value=storage_value,
-                params=params,
+            over_purchase = np.maximum(
+                target_net_load - actual_net_load,
+                0.0,
             )
-
-            future_value = compute_dp_value(
-                planned_purchase=lp_solution["planned_purchase"],
-                scenario_net_load=scenario_net_load,
-                scenario_probability=scenario_probability,
-                price=historical_price,
-                grid=grid,
-                psi=psi,
-                feasible=feasible,
-                emergency_multiplier=emergency_multiplier,
-                storage_value=storage_value,
+            under_purchase = np.maximum(
+                actual_net_load - target_net_load,
+                0.0,
             )
-
-            execution = execute_one_day(
-                planned_purchase=lp_solution["planned_purchase"],
-                actual_net_load=actual_net_load,
-                price=historical_price,
-                soc_start=soc_starts[quantile],
-                params=params,
-                grid=grid,
-                psi=psi,
-                feasible=feasible,
-                future_value=future_value,
-                emergency_multiplier=emergency_multiplier,
+            score = np.sum(
+                historical_price
+                * (
+                    over_purchase
+                    + emergency_multiplier * under_purchase
+                )
             )
-            scores[quantile].append(
-                float(execution["total_cost"])
-            )
-            soc_starts[quantile] = float(
-                execution["soc"][-1]
-            )
+            scores[quantile].append(float(score))
 
     average_scores = {
         quantile: float(np.mean(values))
@@ -795,9 +1053,14 @@ def make_soc_grid(
 
     grid = np.arange(
         params.soc_min,
-        params.soc_max + 0.5 * soc_step,
+        params.soc_max + soc_step,
         soc_step,
     )
+
+    # 裁剪到 [soc_min, soc_max] 以内：
+    # 当步长不能整除 SOC 跨度时，np.arange 的末点可能略高于 soc_max，
+    # 若保留会导致 DP 把 SOC 顶出允许范围，故这里剔除越界点。
+    grid = grid[grid <= params.soc_max + 1e-9]
 
     if not np.any(
         np.isclose(grid, params.soc_initial)
@@ -1239,6 +1502,16 @@ def main():
     )
 
     parser.add_argument(
+        "--output-subdir",
+        type=str,
+        default="problem2_same_type_forecast",
+        help=(
+            "输出到outputs下的子目录，"
+            "默认problem2_same_type_forecast"
+        ),
+    )
+
+    parser.add_argument(
         "--max-days",
         type=int,
         default=None,
@@ -1260,6 +1533,33 @@ def main():
             "历史日前预测的时间衰减系数；"
             "越近的日期权重越大，1.0表示等权平均，默认0.90"
         ),
+    )
+
+    parser.add_argument(
+        "--min-similar-days",
+        type=int,
+        default=3,
+        help=(
+            "同类型历史日的最少样本数；"
+            "同一星期几不足时自动退到工作日/周末，默认3"
+        ),
+    )
+
+    parser.add_argument(
+        "--daily-trend-clip",
+        type=float,
+        default=0.20,
+        help=(
+            "同类型日总量趋势外推的指数截断幅度，"
+            "0.20约等于最多上/下调22%，默认0.20"
+        ),
+    )
+
+    parser.add_argument(
+        "--pv-recent-days",
+        type=int,
+        default=7,
+        help="光伏日总量和日内形状预测使用的最近天数，默认7",
     )
 
     parser.add_argument(
@@ -1431,6 +1731,15 @@ def main():
             "--forecast-recency-decay必须大于0且不大于1"
         )
 
+    if args.min_similar_days <= 0:
+        raise ValueError("--min-similar-days必须为正整数")
+
+    if args.daily_trend_clip < 0:
+        raise ValueError("--daily-trend-clip不能为负数")
+
+    if args.pv_recent_days <= 0:
+        raise ValueError("--pv-recent-days必须为正整数")
+
     if args.forecast_bias_lookback <= 0:
         raise ValueError("--forecast-bias-lookback必须为正整数")
 
@@ -1518,7 +1827,7 @@ def main():
     output_dir = (
         base_dir
         / "outputs"
-        / "problem2"
+        / args.output_subdir
     )
 
     output_dir.mkdir(
@@ -1674,6 +1983,13 @@ def main():
     )
 
     print(
+        "分解预测设置："
+        f"同类型日最少{args.min_similar_days}天，"
+        f"日总量趋势截断{args.daily_trend_clip:.3f}，"
+        f"光伏最近{args.pv_recent_days}天"
+    )
+
+    print(
         "滚动偏差校准："
         f"回看{args.forecast_bias_lookback}天，"
         f"强度{args.forecast_bias_alpha:.3f}"
@@ -1731,9 +2047,13 @@ def main():
         ) = build_historical_scenarios(
             load_energy=load_energy,
             pv_energy=pv_energy,
+            all_dates=all_dates,
             day_index=int(day_index),
             max_scenarios=args.max_scenarios,
             recency_decay=args.forecast_recency_decay,
+            min_similar_days=args.min_similar_days,
+            daily_trend_clip=args.daily_trend_clip,
+            pv_recent_days=args.pv_recent_days,
         )
 
         _, dynamic_risk_mode, dynamic_risk_reason = (
@@ -1807,28 +2127,18 @@ def main():
                 load_energy=load_energy,
                 pv_energy=pv_energy,
                 price=price,
-                candidate_quantiles=[
-                    quantile
-                    for quantile in normal_quantiles
-                    if quantile >= (
-                        args.high_risk_quantile_floor
-                        if dynamic_risk_mode == "高风险"
-                        else args.normal_quantile_floor
-                    )
-                ],
+                candidate_quantiles=normal_quantiles,
                 lookback_days=args.rolling_quantile_lookback,
                 min_history_days=args.rolling_min_history_days,
                 max_scenarios=args.max_scenarios,
                 recency_decay=args.forecast_recency_decay,
+                min_similar_days=args.min_similar_days,
+                daily_trend_clip=args.daily_trend_clip,
+                pv_recent_days=args.pv_recent_days,
                 load_safety_factor=args.load_safety_factor,
                 pv_safety_factor=args.pv_safety_factor,
                 summer_pv_factor=args.summer_pv_factor,
                 emergency_multiplier=emergency_multiplier,
-                storage_value=args.storage_value,
-                params=params,
-                grid=soc_grid,
-                psi=psi,
-                feasible=feasible,
             )
         )
 
