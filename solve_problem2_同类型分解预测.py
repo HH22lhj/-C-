@@ -408,6 +408,8 @@ def build_historical_scenarios(
     min_similar_days: int,
     daily_trend_clip: float,
     pv_recent_days: int,
+    calendar_correction_enabled: bool = False,
+    calendar_correction_strength: float = 0.0,
 ):
     """
     根据当前日前可获得的历史数据构造预测和场景。
@@ -418,8 +420,10 @@ def build_historical_scenarios(
     2. 2025年1月1日不进入正式评价；
     3. 2025年1月1日没有历史预测，因此不进入残差场景库；
     4. 负荷预测拆成“日总量 + 日内形状”：
-       日总量由最近同类型日趋势估计，日内形状由同类型日加权平均；
-    5. 光伏预测同样拆成“日总量 + 日内形状”，但优先使用更近的短窗口；
+       基础样本仍由最近同星期/同类型日确定；
+       月份、季节、节气位置只作为弱日总量修正；
+    5. 光伏预测同样拆成“日总量 + 日内形状”，
+       基础样本仍保留最近历史日，日历信息只做弱日总量修正；
     6. 历史日相对于同类型基准曲线的整日残差作为场景，
        以保留一天内144个时段的共同波动结构。
     """
@@ -451,11 +455,33 @@ def build_historical_scenarios(
         max_scenarios=max_scenarios,
         min_similar_days=min_similar_days,
     )
-
     load_weights = make_recency_weights(
         history_indices=load_history_indices,
         day_index=day_index,
         recency_decay=recency_decay,
+    )
+
+    if len(load_history_indices) < min_similar_days:
+        load_history_indices = select_similar_history_indices(
+            all_dates=all_dates,
+            day_index=day_index,
+            max_scenarios=max_scenarios,
+            min_similar_days=min_similar_days,
+        )
+        load_weights = make_recency_weights(
+            history_indices=load_history_indices,
+            day_index=day_index,
+            recency_decay=recency_decay,
+        )
+
+    load_calendar_history_days = max(
+        max_scenarios * 3,
+        90,
+    )
+    pv_calendar_history_days = max(
+        max_scenarios * 4,
+        pv_recent_days * 4,
+        120,
     )
 
     all_load_totals = load_energy.sum(axis=1)
@@ -464,17 +490,36 @@ def build_historical_scenarios(
         historical_load
     )
 
-    forecast_load_total = np.average(
-        historical_load_totals,
-        weights=load_weights,
+    weighted_forecast_load_total = float(
+        np.average(
+            historical_load_totals,
+            weights=load_weights,
+        )
     )
 
-    forecast_load_total = estimate_same_type_daily_total(
+    trend_forecast_load_total = estimate_same_type_daily_total(
         daily_totals=all_load_totals,
         history_indices=load_history_indices,
         weights=load_weights,
         day_index=day_index,
         daily_trend_clip=daily_trend_clip,
+    )
+
+    forecast_load_total = trend_forecast_load_total
+
+    forecast_load_total = float(
+        np.clip(
+            forecast_load_total,
+            0.85 * weighted_forecast_load_total,
+            1.15 * weighted_forecast_load_total,
+        )
+    )
+
+    baseline_load_total = float(
+        np.average(
+        historical_load_totals,
+        weights=load_weights,
+        )
     )
 
     forecast_load_profile = np.average(
@@ -490,16 +535,42 @@ def build_historical_scenarios(
         forecast_load_total * forecast_load_profile
     )
 
-    baseline_load_total = float(
-        np.average(
-            historical_load_totals,
-            weights=load_weights,
-        )
-    )
     baseline_load = baseline_load_total * forecast_load_profile
 
+    if calendar_correction_enabled:
+        load_calendar_factor = estimate_calendar_total_factor(
+            daily_totals=all_load_totals,
+            all_dates=all_dates,
+            day_index=day_index,
+            baseline_indices=load_history_indices,
+            baseline_weights=load_weights,
+            max_scenarios=max_scenarios,
+            recency_decay=recency_decay,
+            purpose="load",
+            history_days=load_calendar_history_days,
+        )
+        friday_saturday_factor = (
+            estimate_friday_saturday_load_factor(
+                load_energy=load_energy,
+                all_dates=all_dates,
+                day_index=day_index,
+                recency_decay=recency_decay,
+                history_days=load_calendar_history_days,
+                min_samples=min_similar_days,
+            )
+        )
+        load_calendar_factor = (
+            load_calendar_factor
+            * friday_saturday_factor
+        )
+        load_calendar_factor = 1.0 + calendar_correction_strength * (
+            load_calendar_factor - 1.0
+        )
+        forecast_load_total *= load_calendar_factor
+        forecast_load = forecast_load_total * forecast_load_profile
+
     # =====================================================
-    # 2. 光伏预测：最近短窗口的日总量 + 日内形状
+    # 2. 光伏预测：日历相似日的日总量 + 日内形状
     # =====================================================
 
     pv_history_start = max(
@@ -511,27 +582,44 @@ def build_historical_scenarios(
         day_index,
         dtype=int,
     )
-
-    if len(pv_history_indices) == 0:
-        pv_history_indices = load_history_indices
-
     pv_weights = make_recency_weights(
         history_indices=pv_history_indices,
         day_index=day_index,
         recency_decay=recency_decay,
     )
 
+    if len(pv_history_indices) == 0:
+        pv_history_indices, pv_weights = (
+            load_history_indices,
+            load_weights,
+        )
+
+    if len(pv_history_indices) == 0:
+        pv_history_indices = load_history_indices
+        pv_weights = load_weights
+
     historical_pv_for_forecast = pv_energy[pv_history_indices]
     historical_pv_totals, pv_profiles = normalize_profiles(
         historical_pv_for_forecast
     )
 
-    forecast_pv_total = float(
+    weighted_forecast_pv_total = float(
         np.average(
             historical_pv_totals,
             weights=pv_weights,
         )
     )
+
+    forecast_pv_total = weighted_forecast_pv_total
+
+    forecast_pv_total = float(
+        np.clip(
+            forecast_pv_total,
+            0.75 * weighted_forecast_pv_total,
+            1.25 * weighted_forecast_pv_total,
+        )
+    )
+
     forecast_pv_profile = np.average(
         pv_profiles,
         axis=0,
@@ -546,6 +634,23 @@ def build_historical_scenarios(
         axis=0,
         weights=pv_weights,
     )
+
+    if calendar_correction_enabled:
+        pv_calendar_factor = estimate_calendar_total_factor(
+            daily_totals=pv_energy.sum(axis=1),
+            all_dates=all_dates,
+            day_index=day_index,
+            baseline_indices=pv_history_indices,
+            baseline_weights=pv_weights,
+            max_scenarios=max_scenarios,
+            recency_decay=recency_decay,
+            purpose="pv",
+            history_days=pv_calendar_history_days,
+        )
+        pv_calendar_factor = 1.0 + calendar_correction_strength * (
+            pv_calendar_factor - 1.0
+        )
+        forecast_pv_total *= pv_calendar_factor
 
     if forecast_pv_profile.sum() > 1e-12:
         forecast_pv = forecast_pv_total * forecast_pv_profile
@@ -726,6 +831,524 @@ def apply_forecast_safety_margin(
     )
 
 
+def get_base_day_forecast(
+    forecast_cache: dict[tuple, tuple] | None,
+    load_energy: np.ndarray,
+    pv_energy: np.ndarray,
+    all_dates: pd.Series | np.ndarray | list | None,
+    day_index: int,
+    max_scenarios: int,
+    recency_decay: float,
+    min_similar_days: int,
+    daily_trend_clip: float,
+    pv_recent_days: int,
+    calendar_correction_enabled: bool = False,
+    calendar_correction_strength: float = 0.0,
+):
+    """
+    取得某一天的基础预测和历史场景。
+
+    这里的基础预测只使用 day_index 之前的数据。
+    加缓存只是为了避免滚动回测时反复计算同一天，
+    不改变可用信息范围。
+    """
+
+    cache_key = (
+        int(day_index),
+        bool(calendar_correction_enabled),
+        round(float(calendar_correction_strength), 6),
+    )
+
+    if forecast_cache is not None and cache_key in forecast_cache:
+        return forecast_cache[cache_key]
+
+    result = build_historical_scenarios(
+        load_energy=load_energy,
+        pv_energy=pv_energy,
+        all_dates=all_dates,
+        day_index=day_index,
+        max_scenarios=max_scenarios,
+        recency_decay=recency_decay,
+        min_similar_days=min_similar_days,
+        daily_trend_clip=daily_trend_clip,
+        pv_recent_days=pv_recent_days,
+        calendar_correction_enabled=calendar_correction_enabled,
+        calendar_correction_strength=calendar_correction_strength,
+    )
+
+    if forecast_cache is not None:
+        forecast_cache[cache_key] = result
+
+    return result
+
+
+def collect_walk_forward_net_errors(
+    current_day_index: int,
+    all_dates: pd.Series | np.ndarray | list,
+    load_energy: np.ndarray,
+    pv_energy: np.ndarray,
+    lookback_days: int,
+    max_scenarios: int,
+    recency_decay: float,
+    min_similar_days: int,
+    daily_trend_clip: float,
+    pv_recent_days: int,
+    forecast_cache: dict[tuple, tuple] | None = None,
+    calendar_correction_enabled: bool = False,
+    calendar_correction_strength: float = 0.0,
+) -> tuple[np.ndarray, list[int]]:
+    """
+    收集 current_day_index 之前的净负荷预测误差。
+
+    对每个历史日 i，先用 i 之前的数据生成预测，
+    再计算：
+
+        误差 = 实际净负荷 - 预测净负荷
+
+    因此该误差库是严格滚动的，不使用预测日之后的数据。
+    """
+
+    if lookback_days <= 0:
+        return (
+            np.empty((0, load_energy.shape[1]), dtype=float),
+            [],
+        )
+
+    history_start = max(2, current_day_index - lookback_days)
+    errors = []
+    used_indices = []
+
+    for historical_day_index in range(
+        history_start,
+        current_day_index,
+    ):
+        (
+            historical_forecast_load,
+            historical_forecast_pv,
+            _,
+            _,
+            _,
+        ) = get_base_day_forecast(
+            forecast_cache=forecast_cache,
+            load_energy=load_energy,
+            pv_energy=pv_energy,
+            all_dates=all_dates,
+            day_index=historical_day_index,
+            max_scenarios=max_scenarios,
+            recency_decay=recency_decay,
+            min_similar_days=min_similar_days,
+            daily_trend_clip=daily_trend_clip,
+            pv_recent_days=pv_recent_days,
+            calendar_correction_enabled=calendar_correction_enabled,
+            calendar_correction_strength=calendar_correction_strength,
+        )
+
+        historical_forecast_net = (
+            historical_forecast_load
+            - historical_forecast_pv
+        )
+        historical_actual_net = (
+            load_energy[historical_day_index]
+            - pv_energy[historical_day_index]
+        )
+
+        errors.append(
+            historical_actual_net
+            - historical_forecast_net
+        )
+        used_indices.append(historical_day_index)
+
+    if not errors:
+        return (
+            np.empty((0, load_energy.shape[1]), dtype=float),
+            [],
+        )
+
+    return np.stack(errors, axis=0), used_indices
+
+
+def select_rolling_calendar_correction(
+    current_day_index: int,
+    all_dates: pd.Series | np.ndarray | list,
+    load_energy: np.ndarray,
+    pv_energy: np.ndarray,
+    price: np.ndarray,
+    lookback_days: int,
+    min_history_days: int,
+    max_scenarios: int,
+    recency_decay: float,
+    min_similar_days: int,
+    daily_trend_clip: float,
+    pv_recent_days: int,
+    calendar_correction_strength: float,
+    emergency_multiplier: float,
+    forecast_cache: dict[tuple, tuple] | None = None,
+) -> tuple[bool, str]:
+    """
+    用最近历史日选择是否启用弱日历修正。
+
+    对每个历史日分别回测两种日前净负荷基础预测：
+
+    1. 不使用月份、季节、节气和周五/周六修正；
+    2. 使用指定强度的弱日历修正。
+
+    评分采用“普通购电误差 + 临时购电误差的惩罚倍数”，
+    因而会优先避免净负荷被低估，而不是只追求平均误差最小。
+    当前预测日只使用当前日前已经可获得的历史日评分。
+    """
+
+    history_start = max(2, current_day_index - lookback_days)
+    history_indices = list(range(history_start, current_day_index))
+
+    if (
+        lookback_days <= 0
+        or len(history_indices) < min_history_days
+    ):
+        return False, (
+            f"日历修正回测样本不足{min_history_days}天，"
+            "关闭日历修正"
+        )
+
+    scores = {
+        False: [],
+        True: [],
+    }
+
+    for historical_day_index in history_indices:
+        actual_net_load = (
+            load_energy[historical_day_index]
+            - pv_energy[historical_day_index]
+        )
+        historical_price = price[historical_day_index]
+
+        for enabled in (False, True):
+            (
+                historical_forecast_load,
+                historical_forecast_pv,
+                _,
+                _,
+                _,
+            ) = get_base_day_forecast(
+                forecast_cache=forecast_cache,
+                load_energy=load_energy,
+                pv_energy=pv_energy,
+                all_dates=all_dates,
+                day_index=historical_day_index,
+                max_scenarios=max_scenarios,
+                recency_decay=recency_decay,
+                min_similar_days=min_similar_days,
+                daily_trend_clip=daily_trend_clip,
+                pv_recent_days=pv_recent_days,
+                calendar_correction_enabled=enabled,
+                calendar_correction_strength=(
+                    calendar_correction_strength
+                ),
+            )
+
+            historical_forecast_net = (
+                historical_forecast_load
+                - historical_forecast_pv
+            )
+            over_purchase = np.maximum(
+                historical_forecast_net - actual_net_load,
+                0.0,
+            )
+            under_purchase = np.maximum(
+                actual_net_load - historical_forecast_net,
+                0.0,
+            )
+            score = np.sum(
+                historical_price
+                * (
+                    over_purchase
+                    + emergency_multiplier * under_purchase
+                )
+            )
+            scores[enabled].append(float(score))
+
+    baseline_score = float(np.mean(scores[False]))
+    corrected_score = float(np.mean(scores[True]))
+    enabled = corrected_score < baseline_score
+
+    decision = "启用" if enabled else "关闭"
+    return enabled, (
+        f"日历修正回测{len(history_indices)}天："
+        f"关闭={baseline_score:.0f}，"
+        f"启用={corrected_score:.0f}，"
+        f"当前{decision}"
+    )
+
+
+def build_net_load_scenarios_from_errors(
+    forecast_load: np.ndarray,
+    forecast_pv: np.ndarray,
+    scenario_load: np.ndarray,
+    scenario_pv: np.ndarray,
+    net_error_history: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    """
+    用历史净负荷误差构造净负荷场景。
+
+    优先使用：
+
+        预测净负荷 + 历史净负荷预测误差
+
+    若历史误差为空，则退回原脚本的负荷场景减光伏场景。
+    """
+
+    forecast_net_load = forecast_load - forecast_pv
+
+    if len(net_error_history) > 0:
+        scenario_net_load = (
+            forecast_net_load[None, :]
+            + net_error_history
+        )
+        source = "历史净负荷误差场景"
+    else:
+        scenario_net_load = scenario_load - scenario_pv
+        source = "原始负荷-光伏场景"
+
+    scenario_probability = np.full(
+        scenario_net_load.shape[0],
+        1.0 / scenario_net_load.shape[0],
+    )
+
+    return (
+        forecast_net_load,
+        scenario_net_load,
+        scenario_probability,
+        source,
+    )
+
+
+def make_target_net_load_from_error_quantile(
+    forecast_net_load: np.ndarray,
+    scenario_net_load: np.ndarray,
+    net_error_history: np.ndarray,
+    quantile: float,
+    min_history_days: int,
+    correction_alpha: float,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """
+    由净负荷历史误差分位数生成日前LP目标净负荷。
+
+    核心公式：
+
+        目标净负荷 = 预测净负荷
+                 + 修正强度 * Q_q(历史净负荷误差)
+
+    若历史误差样本不足，则退回到场景净负荷的 q 分位数。
+    """
+
+    if len(net_error_history) >= min_history_days:
+        net_error_quantile = np.quantile(
+            net_error_history,
+            quantile,
+            axis=0,
+        )
+        net_error_adjustment = (
+            correction_alpha * net_error_quantile
+        )
+        target_net_load = (
+            forecast_net_load + net_error_adjustment
+        )
+        source = "净负荷历史误差分位数"
+    else:
+        target_net_load = np.quantile(
+            scenario_net_load,
+            quantile,
+            axis=0,
+        )
+        net_error_adjustment = (
+            target_net_load - forecast_net_load
+        )
+        source = "样本不足，使用场景净负荷分位数"
+
+    return (
+        target_net_load,
+        net_error_adjustment,
+        source,
+    )
+
+
+def make_time_period_groups(
+    time_count: int,
+) -> list[tuple[str, str, np.ndarray]]:
+    """
+    将一天划分为若干时段组，用于分时段选择净负荷风险分位数。
+
+    对144个10分钟时段：
+    0:00-6:00   夜间，负荷较平稳；
+    6:00-10:00  上午，负荷与光伏同时爬升；
+    10:00-16:00 中午，光伏高发，净负荷通常较低；
+    16:00-20:00 傍晚，光伏快速下降且负荷仍较高；
+    20:00-24:00 晚间，光伏基本为0。
+    """
+
+    if time_count != 144:
+        return [
+            (
+                "all_day",
+                "全天",
+                np.arange(time_count, dtype=int),
+            )
+        ]
+
+    return [
+        ("night", "夜间0:00-6:00", np.arange(0, 36, dtype=int)),
+        ("morning", "上午6:00-10:00", np.arange(36, 60, dtype=int)),
+        ("midday", "中午10:00-16:00", np.arange(60, 96, dtype=int)),
+        (
+            "evening_ramp",
+            "傍晚16:00-20:00",
+            np.arange(96, 120, dtype=int),
+        ),
+        (
+            "late_evening",
+            "晚间20:00-24:00",
+            np.arange(120, 144, dtype=int),
+        ),
+    ]
+
+
+def format_period_quantiles(
+    period_quantiles: dict[str, float],
+    period_groups: list[tuple[str, str, np.ndarray]],
+) -> str:
+    """将分时段q整理为便于日志和结果表查看的文本。"""
+
+    labels = {
+        key: label
+        for key, label, _ in period_groups
+    }
+
+    return "；".join(
+        f"{labels.get(key, key)}={value:.2f}"
+        for key, value in period_quantiles.items()
+    )
+
+
+def enforce_period_quantile_floors(
+    period_quantiles: dict[str, float],
+    candidate_quantiles: list[float],
+    dynamic_risk_mode: str,
+    normal_quantile_floor: float,
+    high_risk_quantile_floor: float,
+) -> dict[str, float]:
+    """
+    对分时段q施加少量风险下限。
+
+    中午光伏高发，允许分位数降到候选集合下界；
+    傍晚和晚间是净负荷爬坡及高位区间，高风险状态下使用较高下限。
+    """
+
+    minimum_candidate = min(candidate_quantiles)
+    high_risk_periods = {
+        "evening_ramp",
+        "late_evening",
+    }
+    low_risk_periods = {
+        "midday",
+    }
+
+    adjusted = {}
+
+    for key, quantile in period_quantiles.items():
+        if key in low_risk_periods:
+            floor = minimum_candidate
+        else:
+            floor = normal_quantile_floor
+
+        if (
+            dynamic_risk_mode == "高风险"
+            and key in high_risk_periods
+        ):
+            floor = max(
+                floor,
+                high_risk_quantile_floor,
+            )
+
+        adjusted[key] = max(
+            quantile,
+            floor,
+        )
+
+    return adjusted
+
+
+def make_grouped_target_net_load_from_error_quantiles(
+    forecast_net_load: np.ndarray,
+    scenario_net_load: np.ndarray,
+    net_error_history: np.ndarray,
+    period_quantiles: dict[str, float],
+    period_groups: list[tuple[str, str, np.ndarray]],
+    min_history_days: int,
+    correction_alpha: float,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """
+    用不同时间段的q生成全天目标净负荷曲线。
+
+    每个时段组单独计算净负荷误差分位数，再把这些片段拼回
+    144个10分钟时段。这样中午可以较少保守，傍晚可以较多保守。
+    """
+
+    target_net_load = np.zeros_like(
+        forecast_net_load,
+        dtype=float,
+    )
+    net_error_adjustment = np.zeros_like(
+        forecast_net_load,
+        dtype=float,
+    )
+
+    use_error_quantile = (
+        len(net_error_history) >= min_history_days
+    )
+
+    for key, _, slots in period_groups:
+        quantile = period_quantiles[key]
+
+        if use_error_quantile:
+            period_error_quantile = np.quantile(
+                net_error_history[:, slots],
+                quantile,
+                axis=0,
+            )
+            period_adjustment = (
+                correction_alpha
+                * period_error_quantile
+            )
+            target_net_load[slots] = (
+                forecast_net_load[slots]
+                + period_adjustment
+            )
+            net_error_adjustment[slots] = (
+                period_adjustment
+            )
+        else:
+            period_target = np.quantile(
+                scenario_net_load[:, slots],
+                quantile,
+                axis=0,
+            )
+            target_net_load[slots] = period_target
+            net_error_adjustment[slots] = (
+                period_target
+                - forecast_net_load[slots]
+            )
+
+    if use_error_quantile:
+        source = "分时段净负荷历史误差分位数"
+    else:
+        source = "样本不足，使用分时段场景净负荷分位数"
+
+    return (
+        target_net_load,
+        net_error_adjustment,
+        source,
+    )
+
+
 def select_dynamic_quantiles(
     recent_daily_rows: list[dict],
     normal_quantiles: list[float],
@@ -793,22 +1416,29 @@ def select_rolling_optimal_quantile(
     min_similar_days: int,
     daily_trend_clip: float,
     pv_recent_days: int,
-    load_safety_factor: float,
-    pv_safety_factor: float,
-    summer_pv_factor: float,
     emergency_multiplier: float,
+    correction_alpha: float,
+    forecast_cache: dict[tuple, tuple] | None = None,
+    calendar_correction_enabled: bool = False,
+    calendar_correction_strength: float = 0.0,
 ) -> tuple[float, str]:
-    """用最近历史日滚动回测选择当前日前分位数。"""
+    """用最近历史日净负荷预测误差滚动回测选择当前日前分位数。"""
 
     history_start = max(2, current_day_index - lookback_days)
     history_indices = list(range(history_start, current_day_index))
 
     if len(history_indices) < min_history_days:
-        return 0.75, (
-            f"历史样本不足{min_history_days}天，固定使用q=0.75"
+        fallback_quantile = min(
+            candidate_quantiles,
+            key=lambda value: abs(value - 0.75),
+        )
+        return fallback_quantile, (
+            f"历史样本不足{min_history_days}天，"
+            f"使用q={fallback_quantile:.2f}"
         )
 
     scores = {quantile: [] for quantile in candidate_quantiles}
+    valid_history_days = 0
 
     for historical_day_index in history_indices:
         (
@@ -817,7 +1447,8 @@ def select_rolling_optimal_quantile(
             scenario_load,
             scenario_pv,
             _,
-        ) = build_historical_scenarios(
+        ) = get_base_day_forecast(
+            forecast_cache=forecast_cache,
             load_energy=load_energy,
             pv_energy=pv_energy,
             all_dates=all_dates,
@@ -827,47 +1458,60 @@ def select_rolling_optimal_quantile(
             min_similar_days=min_similar_days,
             daily_trend_clip=daily_trend_clip,
             pv_recent_days=pv_recent_days,
-        )
-
-        month = pd.Timestamp(
-            get_date_value(all_dates, historical_day_index)
-        ).month
-        pv_factor = (
-            summer_pv_factor
-            if month in (7, 8, 9)
-            else pv_safety_factor
+            calendar_correction_enabled=calendar_correction_enabled,
+            calendar_correction_strength=calendar_correction_strength,
         )
 
         (
+            net_error_history,
             _,
-            _,
-            scenario_load,
-            scenario_pv,
-        ) = apply_forecast_safety_margin(
-            forecast_load=forecast_load,
-            forecast_pv=forecast_pv,
-            scenario_load=scenario_load,
-            scenario_pv=scenario_pv,
-            load_safety_factor=load_safety_factor,
-            pv_safety_factor=pv_factor,
+        ) = collect_walk_forward_net_errors(
+            current_day_index=historical_day_index,
+            all_dates=all_dates,
+            load_energy=load_energy,
+            pv_energy=pv_energy,
+            lookback_days=lookback_days,
+            max_scenarios=max_scenarios,
+            recency_decay=recency_decay,
+            min_similar_days=min_similar_days,
+            daily_trend_clip=daily_trend_clip,
+            pv_recent_days=pv_recent_days,
+            forecast_cache=forecast_cache,
+            calendar_correction_enabled=calendar_correction_enabled,
+            calendar_correction_strength=calendar_correction_strength,
         )
 
-        scenario_net_load = np.maximum(
-            scenario_load - scenario_pv,
-            0.0,
+        if len(net_error_history) < min_history_days:
+            continue
+
+        valid_history_days += 1
+
+        forecast_net_load, scenario_net_load, _, _ = (
+            build_net_load_scenarios_from_errors(
+                forecast_load=forecast_load,
+                forecast_pv=forecast_pv,
+                scenario_load=scenario_load,
+                scenario_pv=scenario_pv,
+                net_error_history=net_error_history,
+            )
         )
-        actual_net_load = np.maximum(
+
+        actual_net_load = (
             load_energy[historical_day_index]
-            - pv_energy[historical_day_index],
-            0.0,
+            - pv_energy[historical_day_index]
         )
         historical_price = price[historical_day_index]
 
         for quantile in candidate_quantiles:
-            target_net_load = np.quantile(
-                scenario_net_load,
-                quantile,
-                axis=0,
+            target_net_load, _, _ = (
+                make_target_net_load_from_error_quantile(
+                    forecast_net_load=forecast_net_load,
+                    scenario_net_load=scenario_net_load,
+                    net_error_history=net_error_history,
+                    quantile=quantile,
+                    min_history_days=min_history_days,
+                    correction_alpha=correction_alpha,
+                )
             )
             over_purchase = np.maximum(
                 target_net_load - actual_net_load,
@@ -886,6 +1530,16 @@ def select_rolling_optimal_quantile(
             )
             scores[quantile].append(float(score))
 
+    if valid_history_days < min_history_days:
+        fallback_quantile = min(
+            candidate_quantiles,
+            key=lambda value: abs(value - 0.75),
+        )
+        return fallback_quantile, (
+            f"有效回测日不足{min_history_days}天，"
+            f"使用q={fallback_quantile:.2f}"
+        )
+
     average_scores = {
         quantile: float(np.mean(values))
         for quantile, values in scores.items()
@@ -901,6 +1555,182 @@ def select_rolling_optimal_quantile(
     return selected_quantile, (
         f"滚动{len(history_indices)}天回测，"
         f"{score_text}"
+    )
+
+
+def select_rolling_optimal_period_quantiles(
+    current_day_index: int,
+    all_dates: pd.Series | np.ndarray | list,
+    load_energy: np.ndarray,
+    pv_energy: np.ndarray,
+    price: np.ndarray,
+    candidate_quantiles: list[float],
+    period_groups: list[tuple[str, str, np.ndarray]],
+    lookback_days: int,
+    min_history_days: int,
+    max_scenarios: int,
+    recency_decay: float,
+    min_similar_days: int,
+    daily_trend_clip: float,
+    pv_recent_days: int,
+    emergency_multiplier: float,
+    correction_alpha: float,
+    forecast_cache: dict[tuple, tuple] | None = None,
+    calendar_correction_enabled: bool = False,
+    calendar_correction_strength: float = 0.0,
+) -> tuple[dict[str, float], str]:
+    """
+    分时段滚动回测选择净负荷误差分位数。
+
+    和全天统一q相比，这里为每个时段组单独选择q。
+    选择依据仍是历史回测中“买多成本 + 买少的5倍惩罚成本”最低。
+    """
+
+    fallback_quantile = min(
+        candidate_quantiles,
+        key=lambda value: abs(value - 0.75),
+    )
+    fallback = {
+        key: fallback_quantile
+        for key, _, _ in period_groups
+    }
+
+    history_start = max(2, current_day_index - lookback_days)
+    history_indices = list(range(history_start, current_day_index))
+
+    if len(history_indices) < min_history_days:
+        return fallback, (
+            f"历史样本不足{min_history_days}天，"
+            f"各时段使用q={fallback_quantile:.2f}"
+        )
+
+    scores = {
+        key: {quantile: [] for quantile in candidate_quantiles}
+        for key, _, _ in period_groups
+    }
+    valid_history_days = 0
+
+    for historical_day_index in history_indices:
+        (
+            forecast_load,
+            forecast_pv,
+            scenario_load,
+            scenario_pv,
+            _,
+        ) = get_base_day_forecast(
+            forecast_cache=forecast_cache,
+            load_energy=load_energy,
+            pv_energy=pv_energy,
+            all_dates=all_dates,
+            day_index=historical_day_index,
+            max_scenarios=max_scenarios,
+            recency_decay=recency_decay,
+            min_similar_days=min_similar_days,
+            daily_trend_clip=daily_trend_clip,
+            pv_recent_days=pv_recent_days,
+            calendar_correction_enabled=calendar_correction_enabled,
+            calendar_correction_strength=calendar_correction_strength,
+        )
+
+        (
+            net_error_history,
+            _,
+        ) = collect_walk_forward_net_errors(
+            current_day_index=historical_day_index,
+            all_dates=all_dates,
+            load_energy=load_energy,
+            pv_energy=pv_energy,
+            lookback_days=lookback_days,
+            max_scenarios=max_scenarios,
+            recency_decay=recency_decay,
+            min_similar_days=min_similar_days,
+            daily_trend_clip=daily_trend_clip,
+            pv_recent_days=pv_recent_days,
+            forecast_cache=forecast_cache,
+            calendar_correction_enabled=calendar_correction_enabled,
+            calendar_correction_strength=calendar_correction_strength,
+        )
+
+        if len(net_error_history) < min_history_days:
+            continue
+
+        valid_history_days += 1
+
+        forecast_net_load, scenario_net_load, _, _ = (
+            build_net_load_scenarios_from_errors(
+                forecast_load=forecast_load,
+                forecast_pv=forecast_pv,
+                scenario_load=scenario_load,
+                scenario_pv=scenario_pv,
+                net_error_history=net_error_history,
+            )
+        )
+
+        actual_net_load = (
+            load_energy[historical_day_index]
+            - pv_energy[historical_day_index]
+        )
+        historical_price = price[historical_day_index]
+
+        for key, _, slots in period_groups:
+            for quantile in candidate_quantiles:
+                period_error_quantile = np.quantile(
+                    net_error_history[:, slots],
+                    quantile,
+                    axis=0,
+                )
+                target_net_load = (
+                    forecast_net_load[slots]
+                    + correction_alpha
+                    * period_error_quantile
+                )
+
+                over_purchase = np.maximum(
+                    target_net_load
+                    - actual_net_load[slots],
+                    0.0,
+                )
+                under_purchase = np.maximum(
+                    actual_net_load[slots]
+                    - target_net_load,
+                    0.0,
+                )
+                score = np.sum(
+                    historical_price[slots]
+                    * (
+                        over_purchase
+                        + emergency_multiplier
+                        * under_purchase
+                    )
+                )
+                scores[key][quantile].append(float(score))
+
+    if valid_history_days < min_history_days:
+        return fallback, (
+            f"有效回测日不足{min_history_days}天，"
+            f"各时段使用q={fallback_quantile:.2f}"
+        )
+
+    selected_quantiles = {}
+    score_text_parts = []
+
+    for key, label, _ in period_groups:
+        average_scores = {
+            quantile: float(np.mean(values))
+            for quantile, values in scores[key].items()
+        }
+        selected_quantile = min(
+            average_scores,
+            key=average_scores.get,
+        )
+        selected_quantiles[key] = selected_quantile
+        score_text_parts.append(
+            f"{label}:q={selected_quantile:.2f}"
+        )
+
+    return selected_quantiles, (
+        f"分时段滚动{valid_history_days}天回测，"
+        + "，".join(score_text_parts)
     )
 
 
@@ -1563,17 +2393,41 @@ def main():
     )
 
     parser.add_argument(
+        "--calendar-correction-strength",
+        type=float,
+        default=0.5,
+        help=(
+            "月份、季节、节气和周五/周六日历修正强度，"
+            "0表示关闭，1表示完全采用修正，默认0.5"
+        ),
+    )
+
+    parser.add_argument(
+        "--calendar-rolling-lookback",
+        type=int,
+        default=30,
+        help="日历修正滚动回测窗口，单位为天，默认30",
+    )
+
+    parser.add_argument(
+        "--calendar-rolling-min-history-days",
+        type=int,
+        default=7,
+        help="启用日历修正滚动选择所需的最少历史天数，默认7",
+    )
+
+    parser.add_argument(
         "--forecast-bias-lookback",
         type=int,
         default=30,
-        help="负荷和光伏滚动偏差校准回看天数，默认30天",
+        help="净负荷历史误差分位数校准回看天数，默认30天",
     )
 
     parser.add_argument(
         "--forecast-bias-alpha",
         type=float,
-        default=0.5,
-        help="滚动偏差校准强度，1.0表示完全修正，默认0.5",
+        default=1.0,
+        help="净负荷误差分位数修正强度，1.0表示完全修正，默认1.0",
     )
 
     parser.add_argument(
@@ -1642,22 +2496,22 @@ def main():
     parser.add_argument(
         "--load-safety-factor",
         type=float,
-        default=1.05,
-        help="日前预测中负荷的安全上调系数，默认1.05",
+        default=1.00,
+        help="兼容旧参数；当前净负荷误差分位数模型不再使用",
     )
 
     parser.add_argument(
         "--pv-safety-factor",
         type=float,
-        default=0.90,
-        help="非7至9月日前预测中的光伏系数，默认0.90",
+        default=1.00,
+        help="兼容旧参数；当前净负荷误差分位数模型不再使用",
     )
 
     parser.add_argument(
         "--summer-pv-factor",
         type=float,
-        default=1.05,
-        help="7至9月日前预测中的光伏系数，默认1.05",
+        default=1.00,
+        help="兼容旧参数；当前净负荷误差分位数模型不再使用",
     )
 
     parser.add_argument(
@@ -1739,6 +2593,30 @@ def main():
 
     if args.pv_recent_days <= 0:
         raise ValueError("--pv-recent-days必须为正整数")
+
+    if not 0.0 <= args.calendar_correction_strength <= 1.0:
+        raise ValueError(
+            "--calendar-correction-strength必须在0和1之间"
+        )
+
+    if args.calendar_rolling_lookback <= 0:
+        raise ValueError(
+            "--calendar-rolling-lookback必须为正整数"
+        )
+
+    if args.calendar_rolling_min_history_days <= 0:
+        raise ValueError(
+            "--calendar-rolling-min-history-days必须为正整数"
+        )
+
+    if (
+        args.calendar_rolling_min_history_days
+        > args.calendar_rolling_lookback
+    ):
+        raise ValueError(
+            "--calendar-rolling-min-history-days不能大于"
+            "--calendar-rolling-lookback"
+        )
 
     if args.forecast_bias_lookback <= 0:
         raise ValueError("--forecast-bias-lookback必须为正整数")
@@ -1971,10 +2849,9 @@ def main():
     )
 
     print(
-        "预测安全修正："
-        f"负荷×{args.load_safety_factor:.3f}，"
-        f"非夏季光伏×{args.pv_safety_factor:.3f}，"
-        f"7至9月光伏×{args.summer_pv_factor:.3f}"
+        "风险修正："
+        "使用净负荷历史误差分位数，"
+        "不再使用独立负荷/光伏安全系数"
     )
 
     print(
@@ -1990,7 +2867,14 @@ def main():
     )
 
     print(
-        "滚动偏差校准："
+        "日历修正设置："
+        f"强度{args.calendar_correction_strength:.3f}，"
+        f"回看{args.calendar_rolling_lookback}天，"
+        f"最少历史{args.calendar_rolling_min_history_days}天"
+    )
+
+    print(
+        "净负荷误差校准："
         f"回看{args.forecast_bias_lookback}天，"
         f"强度{args.forecast_bias_alpha:.3f}"
     )
@@ -2022,6 +2906,18 @@ def main():
         params,
     )
 
+    period_groups = make_time_period_groups(
+        len(fixed_price)
+    )
+
+    print(
+        "分时段q分组："
+        + "；".join(
+            label
+            for _, label, _ in period_groups
+        )
+    )
+
     # 2月1日没有执行1月1日的控制策略，
     # 因此正式评价期起始SOC采用题目给定初始值6000kWh。
     soc_start = params.soc_initial
@@ -2029,6 +2925,7 @@ def main():
     detail_rows = []
     daily_rows = []
     forecast_history = []
+    forecast_cache = {}
 
     # =====================================================
     # 5. 模型求解
@@ -2038,13 +2935,21 @@ def main():
 
         current_date = all_dates[day_index]
 
+        # 恢复到19:18版本：基础预测不加入月份、季节、节气以及
+        # 周五/周六的日历修正，只保留同类型日分解预测和净负荷
+        # 分时段滚动分位数。日历修正函数保留在脚本中，便于后续
+        # 对照试验，但不参与本次正式评价。
+        calendar_correction_enabled = False
+        calendar_reason = "本次评价关闭日历修正，使用19:18基准版本"
+
         (
             forecast_load,
             forecast_pv,
             scenario_load,
             scenario_pv,
             scenario_probability,
-        ) = build_historical_scenarios(
+        ) = get_base_day_forecast(
+            forecast_cache=forecast_cache,
             load_energy=load_energy,
             pv_energy=pv_energy,
             all_dates=all_dates,
@@ -2054,9 +2959,15 @@ def main():
             min_similar_days=args.min_similar_days,
             daily_trend_clip=args.daily_trend_clip,
             pv_recent_days=args.pv_recent_days,
+            calendar_correction_enabled=(
+                calendar_correction_enabled
+            ),
+            calendar_correction_strength=(
+                args.calendar_correction_strength
+            ),
         )
 
-        _, dynamic_risk_mode, dynamic_risk_reason = (
+        dynamic_candidate_quantiles, dynamic_risk_mode, dynamic_risk_reason = (
             select_dynamic_quantiles(
                 recent_daily_rows=daily_rows,
                 normal_quantiles=normal_quantiles,
@@ -2072,62 +2983,63 @@ def main():
         )
 
         (
-            forecast_load,
-            forecast_pv,
-            scenario_load,
-            scenario_pv,
-            load_bias,
-            pv_bias,
-        ) = apply_rolling_forecast_bias_correction(
-            forecast_load=forecast_load,
-            forecast_pv=forecast_pv,
-            scenario_load=scenario_load,
-            scenario_pv=scenario_pv,
-            forecast_history=forecast_history,
+            net_error_history,
+            net_error_history_indices,
+        ) = collect_walk_forward_net_errors(
+            current_day_index=int(day_index),
+            all_dates=all_dates,
+            load_energy=load_energy,
+            pv_energy=pv_energy,
             lookback_days=args.forecast_bias_lookback,
-            min_history_days=args.rolling_min_history_days,
-            correction_alpha=args.forecast_bias_alpha,
-            load_error_quantile=(
-                args.high_risk_load_error_quantile
-                if dynamic_risk_mode == "高风险"
-                else args.load_error_quantile
+            max_scenarios=args.max_scenarios,
+            recency_decay=args.forecast_recency_decay,
+            min_similar_days=args.min_similar_days,
+            daily_trend_clip=args.daily_trend_clip,
+            pv_recent_days=args.pv_recent_days,
+            forecast_cache=forecast_cache,
+            calendar_correction_enabled=(
+                calendar_correction_enabled
             ),
-            pv_error_quantile=args.pv_error_quantile,
+            calendar_correction_strength=(
+                args.calendar_correction_strength
+            ),
         )
 
         calibrated_forecast_load = forecast_load.copy()
         calibrated_forecast_pv = forecast_pv.copy()
 
         (
-            forecast_load,
-            forecast_pv,
-            scenario_load,
-            scenario_pv,
-        ) = apply_forecast_safety_margin(
+            forecast_net_load,
+            scenario_net_load,
+            scenario_probability,
+            scenario_source,
+        ) = build_net_load_scenarios_from_errors(
             forecast_load=forecast_load,
             forecast_pv=forecast_pv,
             scenario_load=scenario_load,
             scenario_pv=scenario_pv,
-            load_safety_factor=args.load_safety_factor,
-            pv_safety_factor=(
-                args.summer_pv_factor
-                if pd.Timestamp(current_date).month in (7, 8, 9)
-                else args.pv_safety_factor
+            net_error_history=net_error_history,
+        )
+
+        period_candidate_quantiles = normalize_quantiles(
+            normal_quantiles
+            + (
+                high_risk_quantiles
+                if dynamic_risk_mode == "高风险"
+                else []
             ),
+            "--period-candidate-quantiles",
         )
 
-        scenario_net_load = (
-            scenario_load - scenario_pv
-        )
-
-        selected_rolling_quantile, rolling_reason = (
-            select_rolling_optimal_quantile(
+        period_quantiles, rolling_reason = (
+            select_rolling_optimal_period_quantiles(
                 current_day_index=int(day_index),
                 all_dates=all_dates,
                 load_energy=load_energy,
                 pv_energy=pv_energy,
                 price=price,
-                candidate_quantiles=normal_quantiles,
+                candidate_quantiles=period_candidate_quantiles,
+                period_groups=period_groups,
                 lookback_days=args.rolling_quantile_lookback,
                 min_history_days=args.rolling_min_history_days,
                 max_scenarios=args.max_scenarios,
@@ -2135,107 +3047,120 @@ def main():
                 min_similar_days=args.min_similar_days,
                 daily_trend_clip=args.daily_trend_clip,
                 pv_recent_days=args.pv_recent_days,
-                load_safety_factor=args.load_safety_factor,
-                pv_safety_factor=args.pv_safety_factor,
-                summer_pv_factor=args.summer_pv_factor,
                 emergency_multiplier=emergency_multiplier,
+                correction_alpha=args.forecast_bias_alpha,
+                forecast_cache=forecast_cache,
+                calendar_correction_enabled=(
+                    calendar_correction_enabled
+                ),
+                calendar_correction_strength=(
+                    args.calendar_correction_strength
+                ),
             )
         )
 
-        quantile_floor = (
-            args.high_risk_quantile_floor
-            if dynamic_risk_mode == "高风险"
-            else args.normal_quantile_floor
+        period_quantiles = enforce_period_quantile_floors(
+            period_quantiles=period_quantiles,
+            candidate_quantiles=period_candidate_quantiles,
+            dynamic_risk_mode=dynamic_risk_mode,
+            normal_quantile_floor=args.normal_quantile_floor,
+            high_risk_quantile_floor=(
+                args.high_risk_quantile_floor
+            ),
         )
-        selected_rolling_quantile = max(
-            selected_rolling_quantile,
-            quantile_floor,
+
+        selected_period_quantiles = format_period_quantiles(
+            period_quantiles=period_quantiles,
+            period_groups=period_groups,
         )
-        active_quantiles = [selected_rolling_quantile]
+        selected_rolling_quantile = float(
+            np.mean(list(period_quantiles.values()))
+        )
         risk_mode = (
-            "滚动高风险"
+            "分时段高风险"
             if dynamic_risk_mode == "高风险"
-            else "滚动常规"
+            else "分时段常规"
         )
         risk_reason = (
             f"{rolling_reason}；动态判断：{dynamic_risk_reason}"
         )
 
-        best_solution = None
+        (
+            target_net_load,
+            net_error_adjustment,
+            target_source,
+        ) = make_grouped_target_net_load_from_error_quantiles(
+            forecast_net_load=forecast_net_load,
+            scenario_net_load=scenario_net_load,
+            net_error_history=net_error_history,
+            period_quantiles=period_quantiles,
+            period_groups=period_groups,
+            min_history_days=args.rolling_min_history_days,
+            correction_alpha=args.forecast_bias_alpha,
+        )
 
-        for quantile in active_quantiles:
+        lp_solution = solve_day_ahead_lp(
+            target_net_load=target_net_load,
+            price=price[day_index],
+            soc_start=soc_start,
+            storage_value=args.storage_value,
+            params=params,
+        )
 
-            target_net_load = np.quantile(
-                scenario_net_load,
-                quantile,
-                axis=0,
-            )
-
-            lp_solution = solve_day_ahead_lp(
-                target_net_load=target_net_load,
-                price=price[day_index],
-                soc_start=soc_start,
-                storage_value=args.storage_value,
-                params=params,
-            )
-
-            future_value = compute_dp_value(
-                planned_purchase=(
-                    lp_solution[
-                        "planned_purchase"
-                    ]
-                ),
-                scenario_net_load=scenario_net_load,
-                scenario_probability=(
-                    scenario_probability
-                ),
-                price=price[day_index],
-                grid=soc_grid,
-                psi=psi,
-                feasible=feasible,
-                emergency_multiplier=(
-                    emergency_multiplier
-                ),
-                storage_value=args.storage_value,
-            )
-
-            start_state_index = nearest_grid_index(
-                soc_grid,
-                soc_start,
-            )
-
-            # 估计的总成本 = LP目标值（已包含库存价值）+ DP期望紧急购电费用
-            estimated_total_cost = (
-                lp_solution["objective_value"]
-                + future_value[
-                    0,
-                    start_state_index,
+        future_value = compute_dp_value(
+            planned_purchase=(
+                lp_solution[
+                    "planned_purchase"
                 ]
-                + args.storage_value * soc_start  # 补偿起始库存价值
-            )
+            ),
+            scenario_net_load=scenario_net_load,
+            scenario_probability=(
+                scenario_probability
+            ),
+            price=price[day_index],
+            grid=soc_grid,
+            psi=psi,
+            feasible=feasible,
+            emergency_multiplier=(
+                emergency_multiplier
+            ),
+            storage_value=args.storage_value,
+        )
 
-            candidate_solution = {
-                "quantile": quantile,
-                "lp_solution": lp_solution,
-                "future_value": future_value,
-                "target_net_load_sum": float(
-                    np.sum(target_net_load)
-                ),
-                "estimated_total_cost": float(
-                    estimated_total_cost
-                ),
-            }
+        start_state_index = nearest_grid_index(
+            soc_grid,
+            soc_start,
+        )
 
-            if (
-                best_solution is None
-                or candidate_solution[
-                    "estimated_total_cost"
-                ]
-                < best_solution[
-                    "estimated_total_cost"
-                ]
-            ):
-                best_solution = candidate_solution
+        # 估计的总成本 = LP目标值（已包含库存价值）+ DP期望紧急购电费用
+        estimated_total_cost = (
+            lp_solution["objective_value"]
+            + future_value[
+                0,
+                start_state_index,
+            ]
+            + args.storage_value * soc_start  # 补偿起始库存价值
+        )
+
+        best_solution = {
+            "quantile": selected_rolling_quantile,
+            "period_quantiles": period_quantiles,
+            "selected_period_quantiles": (
+                selected_period_quantiles
+            ),
+            "lp_solution": lp_solution,
+            "future_value": future_value,
+            "target_net_load_sum": float(
+                np.sum(target_net_load)
+            ),
+            "net_error_adjustment_sum": float(
+                np.sum(net_error_adjustment)
+            ),
+            "target_source": target_source,
+            "estimated_total_cost": float(
+                estimated_total_cost
+            ),
+        }
 
         if best_solution is None:
             raise RuntimeError(
@@ -2277,8 +3202,8 @@ def main():
         forecast_pv_sum = float(
             np.sum(forecast_pv)
         )
-        forecast_net_load_sum = (
-            forecast_load_sum - forecast_pv_sum
+        forecast_net_load_sum = float(
+            np.sum(forecast_net_load)
         )
         net_load_positive_error = max(
             actual_net_load_sum
@@ -2305,15 +3230,25 @@ def main():
         daily_rows.append(
             {
                 "date": current_date,
+                "calendar_correction_enabled": (
+                    calendar_correction_enabled
+                ),
+                "calendar_correction_reason": (
+                    calendar_reason
+                ),
                 "risk_mode": risk_mode,
                 "risk_reason": risk_reason,
-                "active_quantiles": ",".join(
-                    f"{quantile:.2f}"
-                    for quantile in active_quantiles
-                ),
+                "active_quantiles": best_solution[
+                    "selected_period_quantiles"
+                ],
                 "selected_quantile": best_solution[
                     "quantile"
                 ],
+                "selected_period_quantiles": (
+                    best_solution[
+                        "selected_period_quantiles"
+                    ]
+                ),
                 "scenario_count": len(
                     scenario_probability
                 ),
@@ -2322,12 +3257,20 @@ def main():
                 "forecast_net_load_kwh": (
                     forecast_net_load_sum
                 ),
-                "load_bias_correction_kwh": float(
-                    np.sum(load_bias)
+                "load_bias_correction_kwh": 0.0,
+                "pv_bias_correction_kwh": 0.0,
+                "net_error_correction_kwh": (
+                    best_solution[
+                        "net_error_adjustment_sum"
+                    ]
                 ),
-                "pv_bias_correction_kwh": float(
-                    np.sum(pv_bias)
+                "net_error_history_days": len(
+                    net_error_history_indices
                 ),
+                "scenario_source": scenario_source,
+                "target_source": best_solution[
+                    "target_source"
+                ],
                 "target_net_load_kwh": best_solution[
                     "target_net_load_sum"
                 ],
@@ -2390,7 +3333,7 @@ def main():
         print(
             f"{current_date}完成 | "
             f"{risk_mode} | "
-            f"q={best_solution['quantile']:.2f} | "
+            f"q均值={best_solution['quantile']:.2f} | "
             f"SOC："
             f"{latest_day['soc_start_kwh']:.1f}"
             f"->{soc_start:.1f} | "
