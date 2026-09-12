@@ -1417,6 +1417,7 @@ def select_rolling_optimal_quantile(
     daily_trend_clip: float,
     pv_recent_days: int,
     emergency_multiplier: float,
+    scoring_emergency_multiplier: float,
     correction_alpha: float,
     forecast_cache: dict[tuple, tuple] | None = None,
     calendar_correction_enabled: bool = False,
@@ -1525,7 +1526,7 @@ def select_rolling_optimal_quantile(
                 historical_price
                 * (
                     over_purchase
-                    + emergency_multiplier * under_purchase
+                    + scoring_emergency_multiplier * under_purchase
                 )
             )
             scores[quantile].append(float(score))
@@ -1574,6 +1575,7 @@ def select_rolling_optimal_period_quantiles(
     daily_trend_clip: float,
     pv_recent_days: int,
     emergency_multiplier: float,
+    scoring_emergency_multiplier: float,
     correction_alpha: float,
     forecast_cache: dict[tuple, tuple] | None = None,
     calendar_correction_enabled: bool = False,
@@ -1699,7 +1701,7 @@ def select_rolling_optimal_period_quantiles(
                     historical_price[slots]
                     * (
                         over_purchase
-                        + emergency_multiplier
+                        + scoring_emergency_multiplier
                         * under_purchase
                     )
                 )
@@ -2550,6 +2552,17 @@ def main():
     )
 
     parser.add_argument(
+        "--scoring-emergency-multiplier",
+        type=float,
+        default=2.5,
+        help=(
+            "滚动分位数评分中紧急购电的惩罚权重。"
+            "真实紧急购电惩罚仍是5倍；这里用较低值，"
+            "避免优化出来的q过度保守。默认2.5"
+        ),
+    )
+
+    parser.add_argument(
         "--storage-value",
         type=float,
         default=0.481548,
@@ -2696,6 +2709,9 @@ def main():
             "--rolling-min-history-days不能大于"
             "--rolling-quantile-lookback"
         )
+
+    if args.scoring_emergency_multiplier <= 0:
+        raise ValueError("--scoring-emergency-multiplier必须为正数")
 
     params = StorageParams()
     emergency_multiplier = 5.0
@@ -3048,6 +3064,9 @@ def main():
                 daily_trend_clip=args.daily_trend_clip,
                 pv_recent_days=args.pv_recent_days,
                 emergency_multiplier=emergency_multiplier,
+                scoring_emergency_multiplier=(
+                    args.scoring_emergency_multiplier
+                ),
                 correction_alpha=args.forecast_bias_alpha,
                 forecast_cache=forecast_cache,
                 calendar_correction_enabled=(

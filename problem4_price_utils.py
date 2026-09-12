@@ -40,6 +40,7 @@ class PriceForecastInfo:
 RIDGE_START_LAG_DAYS = 14
 DEFAULT_RIDGE_ALPHA = 0.5
 _RIDGE_MODEL_CACHE: dict[tuple[int, int, float], tuple[np.ndarray, np.ndarray, float, np.ndarray]] = {}
+_RIDGE_DATA_CACHE: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
 
 
 def read_price_matrix(
@@ -281,6 +282,37 @@ def _ridge_feature_matrix_for_day(
     return features
 
 
+def _get_full_ridge_training_data(
+    price_matrix: np.ndarray,
+    dates: pd.DatetimeIndex,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """生成全年可回测的Ridge训练候选样本，并缓存复用。"""
+
+    cache_key = id(price_matrix)
+    cached = _RIDGE_DATA_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    rows: list[np.ndarray] = []
+    targets: list[np.ndarray] = []
+    day_ids: list[np.ndarray] = []
+    for day_index in range(RIDGE_START_LAG_DAYS, price_matrix.shape[0]):
+        rows.append(_ridge_feature_matrix_for_day(price_matrix, dates, day_index))
+        targets.append(price_matrix[day_index] - price_matrix[day_index - 7])
+        day_ids.append(np.full(SLOTS_PER_DAY, day_index, dtype=int))
+
+    if not rows:
+        result = (
+            np.empty((0, 30), dtype=float),
+            np.empty(0, dtype=float),
+            np.empty(0, dtype=int),
+        )
+    else:
+        result = (np.vstack(rows), np.concatenate(targets), np.concatenate(day_ids))
+    _RIDGE_DATA_CACHE[cache_key] = result
+    return result
+
+
 def _build_ridge_training_data(
     price_matrix: np.ndarray,
     dates: pd.DatetimeIndex,
@@ -288,15 +320,9 @@ def _build_ridge_training_data(
 ) -> tuple[np.ndarray, np.ndarray]:
     """生成训练样本，目标为 p[d,t] - p[d-7,t]。"""
 
-    rows: list[np.ndarray] = []
-    targets: list[np.ndarray] = []
-    for day_index in range(RIDGE_START_LAG_DAYS, max_train_day_index + 1):
-        rows.append(_ridge_feature_matrix_for_day(price_matrix, dates, day_index))
-        targets.append(price_matrix[day_index] - price_matrix[day_index - 7])
-
-    if not rows:
-        return np.empty((0, 30), dtype=float), np.empty(0, dtype=float)
-    return np.vstack(rows), np.concatenate(targets)
+    features, residuals, day_ids = _get_full_ridge_training_data(price_matrix, dates)
+    mask = day_ids <= max_train_day_index
+    return features[mask], residuals[mask]
 
 
 def _fit_ridge_residual_model(
